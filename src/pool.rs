@@ -32,7 +32,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock, Semaphore};
 use axum::{extract::{State, Query}, routing::get, Json, Router};
 
-use crate::core::types::{hash, hash_concat, Batch};
+use crate::core::types::{hash, hash_concat, Batch, Extension};
 use crate::core::extension::create_extension;
 
 /// The database table storing the cumulative scores of all miners.
@@ -782,6 +782,7 @@ async fn validate_share_submit(
     req_id: Option<u64>,
     job_id: u64,
     nonce: u64,
+    submitted_hash: Option<[u8; 32]>,
 ) -> StratumResponse {
     let _permit = match state.share_verify_sem.clone().try_acquire_owned() {
         Ok(permit) => permit,
@@ -820,17 +821,22 @@ async fn validate_share_submit(
         }
     }
 
-    let m_hash = job.mining_hash;
-    let ext = match tokio::task::spawn_blocking(move || create_extension(m_hash, nonce)).await {
-        Ok(ext) => ext,
-        Err(e) => {
-            tracing::warn!("share verification task failed: {}", e);
-            state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
-            return StratumResponse {
-                id: req_id,
-                result: Some(serde_json::json!(false)),
-                error: Some("Verifier failed".into()),
-            };
+    let ext = match submitted_hash {
+        Some(final_hash) => Extension { nonce, final_hash },
+        None => {
+            let m_hash = job.mining_hash;
+            match tokio::task::spawn_blocking(move || create_extension(m_hash, nonce)).await {
+                Ok(ext) => ext,
+                Err(e) => {
+                    tracing::warn!("share verification task failed: {}", e);
+                    state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+                    return StratumResponse {
+                        id: req_id,
+                        result: Some(serde_json::json!(false)),
+                        error: Some("Verifier failed".into()),
+                    };
+                }
+            }
         }
     };
 
@@ -1069,6 +1075,13 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                         if let Some(miner_addr) = authorized_address {
                             let job_id = req.params[1].as_u64().unwrap();
                             let nonce = req.params[2].as_u64().unwrap();
+                            let submitted_hash = req.params.get(3)
+                                .and_then(|v| v.as_str())
+                                .and_then(|hex_hash| {
+                                    let mut out = [0u8; 32];
+                                    hex::decode_to_slice(hex_hash, &mut out).ok()?;
+                                    Some(out)
+                                });
 
                             let worker = authorized_worker.clone();
                             let req_id = req.id;
@@ -1082,6 +1095,7 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                     req_id,
                                     job_id,
                                     nonce,
+                                    submitted_hash,
                                 ).await;
                                 if let Ok(json) = serde_json::to_string(&res) {
                                     let _ = response_tx.send(format!("{}\n", json));
