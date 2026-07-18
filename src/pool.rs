@@ -1008,8 +1008,8 @@ async fn validate_share_submit(
 /// 3. **Orphan Theft Defense**: Miner scores are only wiped if the core node accepts the block.
 async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::Result<()> {
     let (read_half, mut write_half) = socket.split();
-    let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
+    let reader = BufReader::new(read_half);
+    let mut lines = reader.lines();
     let mut job_rx = state.job_notifier.subscribe();
     let (response_tx, mut response_rx) = mpsc::unbounded_channel::<String>();
     let mut authorized_address = None;
@@ -1023,13 +1023,12 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
             Some(response) = response_rx.recv() => {
                 write_half.write_all(response.as_bytes()).await?;
             }
-            res = reader.read_line(&mut line) => {
-                if res? == 0 { break; } 
+            res = lines.next_line() => {
+                let Some(line) = res? else { break; };
                 let req: StratumRequest = match serde_json::from_str(&line) {
                     Ok(r) => r,
-                    Err(_) => { line.clear(); continue; }
+                    Err(_) => { continue; }
                 };
-                line.clear();
 
                 match req.method.as_str() {
                     "mining.subscribe" => {
