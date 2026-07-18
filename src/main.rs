@@ -222,6 +222,9 @@ enum Command {
         /// The percentage fee the pool takes from block rewards (e.g. 1.0 for 1%)
         #[arg(long, default_value = "1.0")]
         fee: f64,
+        /// Maximum concurrent CPU share verifications for Stratum submits.
+        #[arg(long, default_value = "64")]
+        share_verify_workers: usize,
     },
     /// Pure Hasher: Connect to a Stratum pool without running a full node
     Miner {
@@ -721,11 +724,11 @@ async fn main() -> Result<()> {
         Command::Peers { rpc_port, rpc_host } => get_peers(rpc_port, rpc_host).await,
         Command::Keygen { rpc_port, rpc_host } => keygen(rpc_port, rpc_host).await,
         Command::Sync { data_dir, peer, port } => sync_from_genesis(data_dir, peer, port).await,
-        Command::Pool { pool_address, bind_addr, rpc_port, rpc_host, fee } => {
+        Command::Pool { pool_address, bind_addr, rpc_port, rpc_host, fee, share_verify_workers } => {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let node_rpc_url = format!("http://{}:{}", rpc_host, rpc_port);
-                midstate::pool::run_stratum_pool(pool_address, bind_addr, node_rpc_url, fee).await;
+                midstate::pool::run_stratum_pool(pool_address, bind_addr, node_rpc_url, fee, share_verify_workers).await;
                 Ok(())
             }
             #[cfg(target_arch = "wasm32")]

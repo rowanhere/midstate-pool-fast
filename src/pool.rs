@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock, Semaphore};
 use axum::{extract::{State, Query}, routing::get, Json, Router};
 
 use crate::core::types::{hash, hash_concat, Batch};
@@ -203,6 +203,12 @@ struct PoolState {
     /// Cumulative accepted shares per (address, worker-name). A pure stats layer for
     /// per-rig breakdown; payout accounting stays strictly per-address and is untouched.
     worker_stats: RwLock<HashMap<([u8; 32], String), u64>>,
+    /// Limits concurrent full Midstate extension validations so GPU miners can submit
+    /// ahead without pinning the Stratum socket loop.
+    share_verify_sem: Arc<Semaphore>,
+    /// redb allows one write transaction at a time; keep CPU validation parallel but
+    /// serialize short score updates.
+    db_write_lock: Mutex<()>,
     /// Set by the block-submission task when a submitted block is REJECTED by the
     /// node or the submission itself FAILS (connection refused / timeout / dropped).
     /// The network tip does not change in either case, so without this flag the
@@ -467,8 +473,16 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
 ///                 The HTTP Audit API will automatically bind to an offset port (e.g., `8081`).
 /// * `node_rpc_url` - The HTTP URL of the backend Midstate node (e.g., `http://10.0.0.5:8545`).
 /// * `pool_fee_percent` - The percentage of the block reward taken by the pool (e.g., 1.0).
-pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_url: String, pool_fee_percent: f64) {
+pub async fn run_stratum_pool(
+    pool_address: String,
+    bind_addr: String,
+    node_rpc_url: String,
+    pool_fee_percent: f64,
+    share_verify_workers: usize,
+) {
     tracing::info!("starting stratum pool server");
+    let share_verify_workers = share_verify_workers.max(1);
+    tracing::info!("share verifier workers: {}", share_verify_workers);
     
     std::fs::create_dir_all("data").unwrap();
     let db = Arc::new(Database::create("data/pool_stratum.redb").unwrap());
@@ -503,6 +517,8 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
         current_height: std::sync::atomic::AtomicU64::new(0),
         share_stats: RwLock::new(HashMap::new()),
         worker_stats: RwLock::new(HashMap::new()),
+        share_verify_sem: Arc::new(Semaphore::new(share_verify_workers)),
+        db_write_lock: Mutex::new(()),
         force_new_job: std::sync::atomic::AtomicBool::new(false),
     });
 
@@ -759,6 +775,232 @@ pub async fn run_stratum_pool(pool_address: String, bind_addr: String, node_rpc_
 // ── Stratum Connection Handler ──────────────────────────────────────────────
 
 /// Handles an active TCP Stratum session with a miner.
+async fn validate_share_submit(
+    state: Arc<PoolState>,
+    miner_addr: [u8; 32],
+    authorized_worker: String,
+    req_id: Option<u64>,
+    job_id: u64,
+    nonce: u64,
+) -> StratumResponse {
+    let _permit = match state.share_verify_sem.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+            return StratumResponse {
+                id: req_id,
+                result: Some(serde_json::json!(false)),
+                error: Some("Verifier busy".into()),
+            };
+        }
+    };
+
+    let job = match state.current_job.read().await.clone() {
+        Some(job) if job.job_id == job_id => job,
+        _ => {
+            state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+            return StratumResponse {
+                id: req_id,
+                result: Some(serde_json::json!(false)),
+                error: Some("Stale job".into()),
+            };
+        }
+    };
+
+    {
+        let mut cache = state.valid_shares.write().await;
+        if !cache.insert(nonce) {
+            drop(cache);
+            state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+            return StratumResponse {
+                id: req_id,
+                result: Some(serde_json::json!(false)),
+                error: Some("Duplicate share".into()),
+            };
+        }
+    }
+
+    let m_hash = job.mining_hash;
+    let ext = match tokio::task::spawn_blocking(move || create_extension(m_hash, nonce)).await {
+        Ok(ext) => ext,
+        Err(e) => {
+            tracing::warn!("share verification task failed: {}", e);
+            state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+            return StratumResponse {
+                id: req_id,
+                result: Some(serde_json::json!(false)),
+                error: Some("Verifier failed".into()),
+            };
+        }
+    };
+
+    if ext.final_hash >= job.share_target {
+        state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+        return StratumResponse {
+            id: req_id,
+            result: Some(serde_json::json!(false)),
+            error: Some("Low difficulty".into()),
+        };
+    }
+
+    {
+        let _db_guard = state.db_write_lock.lock().await;
+        let write_txn = match state.db.begin_write() {
+            Ok(txn) => txn,
+            Err(e) => {
+                tracing::warn!("share score db begin_write failed: {}", e);
+                state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+                return StratumResponse {
+                    id: req_id,
+                    result: Some(serde_json::json!(false)),
+                    error: Some("DB busy".into()),
+                };
+            }
+        };
+        {
+            let mut table = match write_txn.open_table(SHARES_TABLE) {
+                Ok(table) => table,
+                Err(e) => {
+                    tracing::warn!("share score db table open failed: {}", e);
+                    state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+                    return StratumResponse {
+                        id: req_id,
+                        result: Some(serde_json::json!(false)),
+                        error: Some("DB table error".into()),
+                    };
+                }
+            };
+            let current = match table.get(&miner_addr) {
+                Ok(value) => value.map(|v| v.value()).unwrap_or(0),
+                Err(e) => {
+                    tracing::warn!("share score db read failed: {}", e);
+                    state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+                    return StratumResponse {
+                        id: req_id,
+                        result: Some(serde_json::json!(false)),
+                        error: Some("DB read error".into()),
+                    };
+                }
+            };
+            if let Err(e) = table.insert(&miner_addr, current + 1) {
+                tracing::warn!("share score db write failed: {}", e);
+                state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+                return StratumResponse {
+                    id: req_id,
+                    result: Some(serde_json::json!(false)),
+                    error: Some("DB write error".into()),
+                };
+            };
+        }
+        if let Err(e) = write_txn.commit() {
+            tracing::warn!("share score db commit failed: {}", e);
+            state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+            return StratumResponse {
+                id: req_id,
+                result: Some(serde_json::json!(false)),
+                error: Some("DB commit error".into()),
+            };
+        }
+    }
+
+    state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).0 += 1;
+    *state.worker_stats.write().await.entry((miner_addr, authorized_worker.clone())).or_insert(0) += 1;
+
+    if ext.final_hash < job.network_target {
+        tracing::info!("block found by miner {}. submitting to network.", hex::encode(&miner_addr[..8]));
+        let block_hash_hex = hex::encode(ext.final_hash);
+        let block_net_target_hex = hex::encode(job.network_target);
+        let block_height = job.height;
+        let committed_scores = job.committed_scores.clone();
+        let mut batch: Batch = match serde_json::from_value(job.batch_template) {
+            Ok(batch) => batch,
+            Err(e) => {
+                tracing::warn!("failed to decode block template for found block: {}", e);
+                return StratumResponse { id: req_id, result: Some(serde_json::json!(true)), error: None };
+            }
+        };
+        batch.extension = ext;
+        let total_reward: u64 = batch.coinbase.iter().map(|cb| cb.value).sum();
+        let batch_for_node = batch.clone();
+        let rpc_url = state.node_rpc_url.clone();
+        let submit_state = state.clone();
+
+        tokio::spawn(async move {
+            let res = reqwest::Client::new().post(&format!("{}/submit_batch", rpc_url))
+                .json(&batch_for_node).send().await;
+
+            match res {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::info!("block accepted by network. applying score deductions.");
+                    let _db_guard = submit_state.db_write_lock.lock().await;
+                    let write_txn = submit_state.db.begin_write().unwrap();
+                    {
+                        let mut table = write_txn.open_table(SHARES_TABLE).unwrap();
+                        let mut total_score = 0u128;
+                        for iter in table.iter().unwrap() { total_score += iter.unwrap().1.value() as u128; }
+
+                        let mut payouts = Vec::new();
+                        for cb in &batch.coinbase {
+                            let mut a = [0u8; 32]; a.copy_from_slice(&cb.address);
+                            let deduction = ((cb.value as u128 * total_score) / (total_reward as u128)) as u64;
+                            let current = table.get(&a).unwrap().map(|v| v.value()).unwrap_or(0);
+                            table.insert(&a, current.saturating_sub(deduction)).unwrap();
+                            payouts.push(serde_json::json!({
+                                "address": crate::core::types::encode_address_with_checksum(&a),
+                                "value": cb.value
+                            }));
+                        }
+
+                        let mut b_table = write_txn.open_table(BLOCKS_TABLE).unwrap();
+                        let block_data = serde_json::json!({
+                            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                            "block_ts": batch.timestamp,
+                            "hash": block_hash_hex,
+                            "height": block_height,
+                            "total_score": total_score as u64,
+                            "net_target": block_net_target_hex,
+                            "payouts": payouts
+                        }).to_string();
+                        b_table.insert(batch.timestamp, block_data.as_str()).unwrap();
+
+                        let committed_total: u128 = committed_scores.iter().map(|(_, s)| *s as u128).sum();
+                        let scores_json: Vec<serde_json::Value> = committed_scores.iter().map(|(a, s)| serde_json::json!({
+                            "address": crate::core::types::encode_address_with_checksum(a),
+                            "score": s
+                        })).collect();
+                        let scores_data = serde_json::json!({
+                            "total_score": committed_total as u64,
+                            "scores": scores_json
+                        }).to_string();
+                        let mut s_table = write_txn.open_table(BLOCK_SCORES_TABLE).unwrap();
+                        s_table.insert(batch.timestamp, scores_data.as_str()).unwrap();
+                    }
+                    write_txn.commit().unwrap();
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    tracing::warn!(
+                        "block rejected by network ({}): {}. retaining miner scores; requesting fresh job.",
+                        status, body.trim()
+                    );
+                    submit_state.force_new_job.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "block submission to node failed: {}. retaining miner scores; requesting fresh job.",
+                        e
+                    );
+                    submit_state.force_new_job.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+    }
+
+    StratumResponse { id: req_id, result: Some(serde_json::json!(true)), error: None }
+}
+
+/// Handles an active TCP Stratum session with a miner.
 ///
 /// # Security Mechanisms
 /// 1. **Replay Protection**: Identical nonces for the same block are rejected instantly.
@@ -769,6 +1011,7 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     let mut job_rx = state.job_notifier.subscribe();
+    let (response_tx, mut response_rx) = mpsc::unbounded_channel::<String>();
     let mut authorized_address = None;
     // Worker name from mining.authorize params[1] (stratum convention). Scopes this
     // connection's accepted shares to a rig for the per-worker breakdown; defaults
@@ -777,6 +1020,9 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
 
     loop {
         tokio::select! {
+            Some(response) = response_rx.recv() => {
+                write_half.write_all(response.as_bytes()).await?;
+            }
             res = reader.read_line(&mut line) => {
                 if res? == 0 { break; } 
                 let req: StratumRequest = match serde_json::from_str(&line) {
@@ -824,6 +1070,26 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                         if let Some(miner_addr) = authorized_address {
                             let job_id = req.params[1].as_u64().unwrap();
                             let nonce = req.params[2].as_u64().unwrap();
+
+                            let worker = authorized_worker.clone();
+                            let req_id = req.id;
+                            let state_for_task = state.clone();
+                            let response_tx = response_tx.clone();
+                            tokio::spawn(async move {
+                                let res = validate_share_submit(
+                                    state_for_task,
+                                    miner_addr,
+                                    worker,
+                                    req_id,
+                                    job_id,
+                                    nonce,
+                                ).await;
+                                if let Ok(json) = serde_json::to_string(&res) {
+                                    let _ = response_tx.send(format!("{}\n", json));
+                                }
+                            });
+                            continue;
+                            /*
 
                             if let Some(job) = state.current_job.read().await.clone() {
                                 if job.job_id == job_id {
@@ -979,6 +1245,7 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                     }
                                 }
                             }
+                            */
                         }
                     }
                     _ => {}
