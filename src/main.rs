@@ -82,7 +82,7 @@ impl Config {
 
             bootstrap_peers = [
                 "/ip4/134.199.148.215/tcp/9333/p2p/12D3KooWPbR63SQg1UBLpAMiNngqrRHGM4LaMP8ieAJUxhfw7dxv",
-                "/ip4/74.208.253.44/tcp/9333/p2p/12D3KooWS4BgeUcmWg27ZZdYxJeVJsMy9qMdCi6QXAxs9H6nDLc6"
+                "/ip4/74.208.253.44/tcp/9333/p2p/12D3KooWBqph3BWQxc3xsusvCijS88RaAEZagZZwwxAwP2Xs1CTE"
             ]
 
             # List of Peer IDs to block from connecting
