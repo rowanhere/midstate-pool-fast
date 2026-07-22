@@ -30,7 +30,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock, Semaphore};
-use axum::{extract::{State, Query}, routing::get, Json, Router};
+use axum::{extract::{State, Query}, http::StatusCode, routing::{get, post}, Json, Router};
 
 use crate::core::types::{hash, hash_concat, Batch, Extension};
 use crate::core::extension::create_extension;
@@ -220,6 +220,116 @@ struct PoolState {
 #[derive(Deserialize)]
 struct ProofQuery {
     address: String,
+}
+
+#[derive(Deserialize)]
+struct HttpWorkQuery {
+    address: String,
+    #[serde(default)]
+    worker: Option<String>,
+    #[serde(default)]
+    sig: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HttpLongpollQuery {
+    #[serde(default)]
+    height: u64,
+}
+
+#[derive(Deserialize)]
+struct HttpShareRequest {
+    batch: Batch,
+    miner_addr: String,
+}
+
+#[derive(Deserialize)]
+struct HttpHeartbeatRequest {
+    address: String,
+    #[serde(default)]
+    worker: Option<String>,
+}
+
+/// Compatibility API for the native HTTP CUDA miner. Its private `sig` only
+/// identifies a build; pool-side target and replay validation remains authoritative.
+async fn get_http_work(
+    State(state): State<Arc<PoolState>>,
+    Query(query): Query<HttpWorkQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    crate::core::types::parse_address_flexible(&query.address)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid address".to_string()))?;
+    let _ = (&query.worker, &query.sig);
+
+    let job = state.current_job.read().await.clone()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no mining job".to_string()))?;
+    Ok(Json(serde_json::json!({
+        "job_id": job.job_id.to_string(),
+        "height": job.height,
+        "target": hex::encode(job.network_target),
+        "share_target": hex::encode(job.share_target),
+        "batch": job.batch_template,
+    })))
+}
+
+async fn get_http_longpoll(
+    State(state): State<Arc<PoolState>>,
+    Query(query): Query<HttpLongpollQuery>,
+) -> Json<serde_json::Value> {
+    let current = state.current_job.read().await.as_ref().map(|job| job.height)
+        .unwrap_or_else(|| state.current_height.load(std::sync::atomic::Ordering::Relaxed));
+    if current != query.height {
+        return Json(serde_json::json!({ "height": current }));
+    }
+
+    let mut jobs = state.job_notifier.subscribe();
+    let height = match tokio::time::timeout(Duration::from_secs(30), jobs.recv()).await {
+        Ok(Ok(job)) => job.height,
+        _ => state.current_job.read().await.as_ref().map(|job| job.height)
+            .unwrap_or_else(|| state.current_height.load(std::sync::atomic::Ordering::Relaxed)),
+    };
+    Json(serde_json::json!({ "height": height }))
+}
+
+async fn post_http_share(
+    State(state): State<Arc<PoolState>>,
+    Json(request): Json<HttpShareRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let miner_addr = match crate::core::types::parse_address_flexible(&request.miner_addr) {
+        Ok(address) => address,
+        Err(_) => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "accepted": false, "error": "invalid address" }))),
+    };
+    let job_id = match state.current_job.read().await.as_ref() {
+        Some(job) => job.job_id,
+        None => return (StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "accepted": false, "error": "no mining job" }))),
+    };
+
+    let response = validate_share_submit(
+        state,
+        miner_addr,
+        "http-native".to_string(),
+        None,
+        job_id,
+        request.batch.extension.nonce,
+        Some(request.batch.extension.final_hash),
+    ).await;
+
+    if response.result.as_ref().and_then(serde_json::Value::as_bool) == Some(true) {
+        (StatusCode::OK, Json(serde_json::json!({ "accepted": true })))
+    } else {
+        (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "accepted": false,
+            "error": response.error.unwrap_or_else(|| "share rejected".to_string()),
+        })))
+    }
+}
+
+async fn post_http_heartbeat(
+    Json(request): Json<HttpHeartbeatRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let _ = (request.address, request.worker);
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
 
 // ── HTTP API for Miner Audits ───────────────────────────────────────────────
@@ -590,7 +700,12 @@ pub async fn run_stratum_pool(
         let app = Router::new()
             .route("/pool", get(pool_ui))            
             .route("/midstate.css", get(pool_css))   
-            .route("/pool/stats", get(get_pool_stats)) 
+            .route("/pool/stats", get(get_pool_stats))
+            .route("/pool/work", get(get_http_work))
+            .route("/pool/longpoll", get(get_http_longpoll))
+            .route("/pool/share", post(post_http_share))
+            .route("/pool/submit", post(post_http_share))
+            .route("/pool/heartbeat", post(post_http_heartbeat))
             .route("/api/proof", get(get_proof))     
             .route("/api/block_scores", get(get_block_scores))
             .with_state(api_state);
