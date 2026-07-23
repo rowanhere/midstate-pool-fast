@@ -479,7 +479,35 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
     // redb scan. Attached per-miner below for an efficiency readout.
     let share_snapshot = state.share_stats.read().await.clone();
 
-    if let Ok(read_txn) = state.db.begin_read() {
+    // Per-(address, worker) accepted-share tallies for the rig breakdown.
+    let mut workers = Vec::new();
+    let mut solo_scores: HashMap<[u8; 32], u64> = HashMap::new();
+    {
+        let ws = state.worker_stats.read().await;
+        for ((addr, name), count) in ws.iter() {
+            *solo_scores.entry(*addr).or_insert(0) += *count;
+            workers.push(serde_json::json!({
+                "address": crate::core::types::encode_address_with_checksum(addr),
+                "worker": name,
+                "score": count
+            }));
+        }
+    }
+
+    if state.solo_mode {
+        for (a, s) in &solo_scores {
+            if *s > 0 {
+                let (accepted, rejected) = share_snapshot.get(a).copied().unwrap_or((*s, 0));
+                miners.push(serde_json::json!({
+                    "address": crate::core::types::encode_address_with_checksum(a),
+                    "score": s,
+                    "accepted": accepted,
+                    "rejected": rejected
+                }));
+                total_score += *s;
+            }
+        }
+    } else if let Ok(read_txn) = state.db.begin_read() {
         if let Ok(table) = read_txn.open_table(SHARES_TABLE) {
             for iter in table.iter().unwrap() {
                 let (addr, score) = iter.unwrap();
@@ -501,19 +529,6 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
     }
 
     miners.sort_by_key(|m| std::cmp::Reverse(m["score"].as_u64().unwrap_or(0)));
-
-    // Per-(address, worker) accepted-share tallies for the rig breakdown.
-    let mut workers = Vec::new();
-    {
-        let ws = state.worker_stats.read().await;
-        for ((addr, name), count) in ws.iter() {
-            workers.push(serde_json::json!({
-                "address": crate::core::types::encode_address_with_checksum(addr),
-                "worker": name,
-                "score": count
-            }));
-        }
-    }
 
     let mut blocks = Vec::new();
     let mut total_blocks = 0u64;
@@ -538,8 +553,14 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
         .as_ref()
         .map(|job| hex::encode(job.network_target))
         .unwrap_or_default();
-    // The current Merkle precommitment root (what miners audit against this block).
-    let merkle_root_hex = hex::encode(state.current_tree.read().await.root);
+    // The current Merkle precommitment root. Solo mode has no shared payout
+    // snapshot, so expose a live root over its accepted worker shares for stats.
+    let merkle_root_hex = if state.solo_mode {
+        let shares = solo_scores.into_iter().filter(|(_, s)| *s > 0).collect();
+        hex::encode(ShareMerkleTree::build(shares).root)
+    } else {
+        hex::encode(state.current_tree.read().await.root)
+    };
     const BLOCK_TIME_SECS: u64 = 60;
 
     // --- OPTIONAL FLOAT FALLBACK (legacy clients / non-BigInt environments) ---
@@ -796,6 +817,30 @@ pub async fn run_stratum_pool(
             // can show the live chain height even between our own block finds.
             let tip_height = net_state["height"].as_u64().unwrap_or(0);
             state_clone.current_height.store(tip_height, std::sync::atomic::Ordering::Relaxed);
+            state_clone.current_block_reward.store(
+                net_state["block_reward"].as_u64().unwrap_or(0),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+
+            if state_clone.solo_mode {
+                if let Some(t_hex) = net_state["target"].as_str() {
+                    let mut template_target = [0u8; 32];
+                    if hex::decode_to_slice(t_hex, &mut template_target).is_ok() {
+                        let job = Job {
+                            job_id: 0,
+                            mining_hash: [0; 32],
+                            share_target: state_clone.share_target,
+                            network_target: template_target,
+                            batch_template: serde_json::Value::Null,
+                            height: tip_height.saturating_add(1),
+                            committed_scores: Arc::new(Vec::new()),
+                        };
+                        *state_clone.current_job.write().await = Some(job);
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
 
             // A rejected or failed block submission sets `force_new_job`: the network
             // tip won't change in that case, so a tip-only condition would re-serve
