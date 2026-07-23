@@ -900,12 +900,26 @@ pub async fn run_stratum_pool(
                     if let Some(m_hex) = template["mining_midstate"].as_str() {
                         let mut m_hash = [0u8; 32];
                         hex::decode_to_slice(m_hex, &mut m_hash).unwrap();
+                        let mut template_target = [0u8; 32];
+                        let target_is_valid = template["target"]
+                            .as_str()
+                            .map(|target| hex::decode_to_slice(target, &mut template_target).is_ok())
+                            .unwrap_or(false);
+                        if !target_is_valid {
+                            tracing::error!("Node returned a block template without a valid target");
+                            last_network_tip.clear();
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
 
                         let job = Job {
                             job_id: job_counter,
                             mining_hash: m_hash,
                             share_target: state_clone.share_target,
-                            network_target: n_target,
+                            // The template and target must be an atomic pair. A separately
+                            // polled /state target can belong to a different tip by the time
+                            // the template arrives, producing false block candidates.
+                            network_target: template_target,
                             batch_template: template["batch_template"].clone(),
                             height: tip_height.saturating_add(1),
                             committed_scores: std::sync::Arc::new(shares_vec.clone()),
