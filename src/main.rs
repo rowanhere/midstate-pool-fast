@@ -215,6 +215,12 @@ enum Command {
         pool_address: String,
         #[arg(long, default_value = "0.0.0.0:3333")]
         bind_addr: String,
+        #[arg(long, default_value = "0.0.0.0:8081")]
+        audit_bind: String,
+        #[arg(long, default_value = "data/pool_stratum.redb")]
+        db_path: PathBuf,
+        #[arg(long, default_value = "pool")]
+        mode: String,
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
         #[arg(long, default_value = "127.0.0.1")]
@@ -729,11 +735,11 @@ async fn main() -> Result<()> {
         Command::Peers { rpc_port, rpc_host } => get_peers(rpc_port, rpc_host).await,
         Command::Keygen { rpc_port, rpc_host } => keygen(rpc_port, rpc_host).await,
         Command::Sync { data_dir, peer, port } => sync_from_genesis(data_dir, peer, port).await,
-        Command::Pool { pool_address, bind_addr, rpc_port, rpc_host, fee, share_verify_workers } => {
+        Command::Pool { pool_address, bind_addr, audit_bind, db_path, mode, rpc_port, rpc_host, fee, share_verify_workers } => {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let node_rpc_url = format!("http://{}:{}", rpc_host, rpc_port);
-                midstate::pool::run_stratum_pool(pool_address, bind_addr, node_rpc_url, fee, share_verify_workers).await;
+                midstate::pool::run_stratum_pool(pool_address, bind_addr, audit_bind, db_path, mode, node_rpc_url, fee, share_verify_workers).await?;
                 Ok(())
             }
             #[cfg(target_arch = "wasm32")]

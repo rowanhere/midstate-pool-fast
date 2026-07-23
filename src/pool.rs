@@ -25,6 +25,7 @@
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -182,9 +183,9 @@ struct PoolState {
     pool_address: String,
     share_target: [u8; 32],
     current_tree: RwLock<ShareMerkleTree>,
-    /// The Share Replay Cache. Tracks successfully submitted nonces for the *current* job.
+    /// The Share Replay Cache. Tracks successfully submitted (job, nonce) pairs.
     /// Wiped clean every time a new block is detected to prevent OOM.
-    valid_shares: RwLock<HashSet<u64>>, 
+    valid_shares: RwLock<HashSet<(u64, u64)>>, 
     /// Dynamic RPC URL of the core node, provided at startup.
     node_rpc_url: String,
     /// The percentage fee the pool takes from block rewards (e.g., 1.0 for 1%).
@@ -215,6 +216,24 @@ struct PoolState {
     /// template loop would never rebuild and miners would re-grind the same doomed
     /// template forever. Consumed (cleared) by the polling loop when it rebuilds.
     force_new_job: std::sync::atomic::AtomicBool,
+    solo_job_counter: std::sync::atomic::AtomicU64,
+    solo_mode: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PoolMode {
+    Pool,
+    Solo,
+}
+
+impl PoolMode {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "pool" | "pplns" | "shared" => Ok(Self::Pool),
+            "solo" => Ok(Self::Solo),
+            _ => anyhow::bail!("invalid pool mode '{}'; expected 'pool' or 'solo'", value),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -309,6 +328,7 @@ async fn post_http_share(
         state,
         miner_addr,
         "http-native".to_string(),
+        None,
         None,
         job_id,
         request.batch.extension.nonce,
@@ -589,16 +609,22 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
 pub async fn run_stratum_pool(
     pool_address: String,
     bind_addr: String,
+    audit_bind: String,
+    db_path: PathBuf,
+    mode: String,
     node_rpc_url: String,
     pool_fee_percent: f64,
     share_verify_workers: usize,
-) {
-    tracing::info!("starting stratum pool server");
+) -> anyhow::Result<()> {
+    let pool_mode = PoolMode::parse(&mode)?;
+    tracing::info!("starting stratum pool server in {:?} mode", pool_mode);
     let share_verify_workers = share_verify_workers.max(1);
     tracing::info!("share verifier workers: {}", share_verify_workers);
     
-    std::fs::create_dir_all("data").unwrap();
-    let db = Arc::new(Database::create("data/pool_stratum.redb").unwrap());
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let db = Arc::new(Database::create(&db_path)?);
     
     let write_txn = db.begin_write().unwrap();
     {
@@ -664,37 +690,39 @@ pub async fn run_stratum_pool(
         share_verify_sem: Arc::new(Semaphore::new(share_verify_workers)),
         db_write_lock: Mutex::new(()),
         force_new_job: std::sync::atomic::AtomicBool::new(false),
+        solo_job_counter: std::sync::atomic::AtomicU64::new(
+            (1u64 << 63) | std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ),
+        solo_mode: pool_mode == PoolMode::Solo,
     });
 
     let api_state = state.clone();
-    let parts: Vec<&str> = bind_addr.split(':').collect();
-    let host = if parts.is_empty() { "0.0.0.0" } else { parts[0] };
-    let base_stratum_port: u16 = if parts.len() > 1 { parts[1].parse().unwrap_or(3333) } else { 3333 };
+    let api_bind_addr = audit_bind.clone();
+    let stratum_bind_addr = bind_addr.clone();
 
     // ── Tandem Port Binding ──
     // Bind both the Stratum Port and the Audit API port simultaneously.
     // If either fails (e.g., stuck in TIME_WAIT), bump the offset and try the next pair. 
     // This guarantees the miner's offset math always aligns perfectly with the server.
-    let mut offset = 0;
     let (api_listener, stratum_listener) = loop {
-        let current_stratum = base_stratum_port + offset;
-        let current_api = 8081 + offset;
-
-        let a_res = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", current_api)).await;
-        let s_res = tokio::net::TcpListener::bind(format!("{}:{}", host, current_stratum)).await;
+        let a_res = tokio::net::TcpListener::bind(&api_bind_addr).await;
+        let s_res = tokio::net::TcpListener::bind(&stratum_bind_addr).await;
 
         match (a_res, s_res) {
             (Ok(a), Ok(s)) => {
-                tracing::info!("audit api bound to 0.0.0.0:{}", current_api);
-                tracing::info!("stratum pool bound to {}:{}", host, current_stratum);
+                tracing::info!("audit api bound to {}", api_bind_addr);
+                tracing::info!("stratum pool bound to {}", stratum_bind_addr);
                 break (a, s);
             }
-            _ => {
-                tracing::warn!("port pair {}/{} in use. trying next pair...", current_stratum, current_api);
-                offset += 1;
-                if offset > 10 {
-                    panic!("fatal: could not find available stratum/api port pairs");
-                }
+            (a_res, s_res) => {
+                panic!(
+                    "fatal: could not bind stratum/api listeners: stratum={:?}, audit={:?}",
+                    s_res.err(),
+                    a_res.err()
+                );
             }
         }
     };
@@ -948,11 +976,102 @@ pub async fn run_stratum_pool(
 
 // ── Stratum Connection Handler ──────────────────────────────────────────────
 
+async fn build_solo_job(state: Arc<PoolState>, miner_addr: [u8; 32]) -> anyhow::Result<Job> {
+    let client = reqwest::Client::new();
+    let rpc_url = state.node_rpc_url.clone();
+
+    let net_state: serde_json::Value = client
+        .get(&format!("{}/state", rpc_url))
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    if net_state["is_syncing"].as_bool().unwrap_or(false) {
+        anyhow::bail!("backend node is syncing");
+    }
+
+    let tip_height = net_state["height"].as_u64().unwrap_or(0);
+    let mut network_target = [0u8; 32];
+    hex::decode_to_slice(net_state["target"].as_str().unwrap_or(""), &mut network_target)
+        .map_err(|e| anyhow::anyhow!("invalid node target: {}", e))?;
+
+    let mut expected_total = net_state["block_reward"].as_u64().unwrap_or(0);
+    let template_data = loop {
+        let mut coinbase_json = Vec::new();
+        let pool_fee = (expected_total as f64 * (state.pool_fee_percent / 100.0)) as u64;
+        let actual_distributable = expected_total.saturating_sub(pool_fee);
+
+        if pool_fee > 0 {
+            for coin in crate::core::types::decompose_value(pool_fee) {
+                coinbase_json.push(serde_json::json!({
+                    "address": state.pool_address,
+                    "value": coin,
+                    "salt": hex::encode(rand::random::<[u8; 32]>())
+                }));
+            }
+        }
+
+        for coin in crate::core::types::decompose_value(actual_distributable) {
+            coinbase_json.push(serde_json::json!({
+                "address": hex::encode(miner_addr),
+                "value": coin,
+                "salt": hex::encode(rand::random::<[u8; 32]>())
+            }));
+        }
+
+        let req = serde_json::json!({ "coinbase": coinbase_json });
+        let json: serde_json::Value = client
+            .post(&format!("{}/block_template", rpc_url))
+            .json(&req)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        if let Some(err) = json.get("error") {
+            let err_str = err.as_str().unwrap_or("");
+            if err_str.contains("Expected: ") {
+                if let Some(num_str) = err_str.split("Expected: ").nth(1) {
+                    if let Ok(new_expected) = num_str.parse::<u64>() {
+                        tracing::info!("Mempool fees detected. Adjusting solo block value to {}", new_expected);
+                        expected_total = new_expected;
+                        continue;
+                    }
+                }
+            }
+            anyhow::bail!("node rejected solo block template request: {}", err_str);
+        }
+
+        break json;
+    };
+
+    let mut mining_hash = [0u8; 32];
+    hex::decode_to_slice(template_data["mining_midstate"].as_str().unwrap_or(""), &mut mining_hash)
+        .map_err(|e| anyhow::anyhow!("invalid solo mining midstate: {}", e))?;
+
+    let mut template_target = [0u8; 32];
+    hex::decode_to_slice(template_data["target"].as_str().unwrap_or(""), &mut template_target)
+        .map_err(|e| anyhow::anyhow!("invalid solo template target: {}", e))?;
+
+    let job_id = state.solo_job_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    Ok(Job {
+        job_id,
+        mining_hash,
+        share_target: state.share_target,
+        network_target: template_target,
+        batch_template: template_data["batch_template"].clone(),
+        height: tip_height.saturating_add(1),
+        committed_scores: Arc::new(Vec::new()),
+    })
+}
+
 /// Handles an active TCP Stratum session with a miner.
 async fn validate_share_submit(
     state: Arc<PoolState>,
     miner_addr: [u8; 32],
     authorized_worker: String,
+    solo_job: Option<Job>,
     req_id: Option<u64>,
     job_id: u64,
     nonce: u64,
@@ -970,21 +1089,35 @@ async fn validate_share_submit(
         }
     };
 
-    let job = match state.current_job.read().await.clone() {
-        Some(job) if job.job_id == job_id => job,
-        _ => {
+    let is_solo = solo_job.is_some();
+    let job = if let Some(job) = solo_job {
+        if job.job_id == job_id {
+            job
+        } else {
             state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
             return StratumResponse {
                 id: req_id,
                 result: Some(serde_json::json!(false)),
-                error: Some("Stale job".into()),
+                error: Some("Stale solo job".into()),
             };
+        }
+    } else {
+        match state.current_job.read().await.clone() {
+            Some(job) if job.job_id == job_id => job,
+            _ => {
+                state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+                return StratumResponse {
+                    id: req_id,
+                    result: Some(serde_json::json!(false)),
+                    error: Some("Stale job".into()),
+                };
+            }
         }
     };
 
     {
         let mut cache = state.valid_shares.write().await;
-        if !cache.insert(nonce) {
+        if !cache.insert((job.job_id, nonce)) {
             drop(cache);
             state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
             return StratumResponse {
@@ -1059,7 +1192,7 @@ async fn validate_share_submit(
         };
     }
 
-    {
+    if !is_solo {
         let _db_guard = state.db_write_lock.lock().await;
         let write_txn = match state.db.begin_write() {
             Ok(txn) => txn,
@@ -1140,6 +1273,7 @@ async fn validate_share_submit(
         let batch_for_node = batch.clone();
         let rpc_url = state.node_rpc_url.clone();
         let submit_state = state.clone();
+        let solo_submission = is_solo;
 
         tokio::spawn(async move {
             let res = reqwest::Client::new().post(&format!("{}/submit_batch", rpc_url))
@@ -1147,7 +1281,11 @@ async fn validate_share_submit(
 
             match res {
                 Ok(resp) if resp.status().is_success() => {
-                    tracing::info!("block accepted by network. applying score deductions.");
+                    if solo_submission {
+                        tracing::info!("solo block accepted by network. retaining shared pool scores.");
+                    } else {
+                        tracing::info!("block accepted by network. applying score deductions.");
+                    }
                     let _db_guard = submit_state.db_write_lock.lock().await;
                     let write_txn = submit_state.db.begin_write().unwrap();
                     {
@@ -1158,9 +1296,17 @@ async fn validate_share_submit(
                         let mut payouts = Vec::new();
                         for cb in &batch.coinbase {
                             let mut a = [0u8; 32]; a.copy_from_slice(&cb.address);
-                            let deduction = ((cb.value as u128 * total_score) / (total_reward as u128)) as u64;
-                            let current = table.get(&a).unwrap().map(|v| v.value()).unwrap_or(0);
-                            table.insert(&a, current.saturating_sub(deduction)).unwrap();
+                            if !solo_submission && total_reward > 0 {
+                                let deduction = ((cb.value as u128 * total_score) / (total_reward as u128)) as u64;
+                                if let Some(current) = table.get(&a).unwrap().map(|v| v.value()) {
+                                    let remaining = current.saturating_sub(deduction);
+                                    if remaining > 0 {
+                                        table.insert(&a, remaining).unwrap();
+                                    } else {
+                                        table.remove(&a).unwrap();
+                                    }
+                                }
+                            }
                             payouts.push(serde_json::json!({
                                 "address": crate::core::types::encode_address_with_checksum(&a),
                                 "value": cb.value
@@ -1229,6 +1375,8 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
     let mut job_rx = state.job_notifier.subscribe();
     let (response_tx, mut response_rx) = mpsc::unbounded_channel::<String>();
     let mut authorized_address = None;
+    let mut authorized_solo = false;
+    let mut solo_job: Option<Job> = None;
     // Worker name from mining.authorize params[1] (stratum convention). Scopes this
     // connection's accepted shares to a rig for the per-worker breakdown; defaults
     // when a miner omits it (today's reference miner sends "worker1").
@@ -1252,7 +1400,14 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                         write_half.write_all(format!("{}\n", serde_json::to_string(&res)?).as_bytes()).await?;
                     }
                     "mining.authorize" => {
-                        let address = req.params[0].as_str().unwrap_or("").to_string();
+                        let raw_address = req.params[0].as_str().unwrap_or("").to_string();
+                        let (solo_requested, address) = if raw_address.len() >= 5
+                            && raw_address[..5].eq_ignore_ascii_case("solo:")
+                        {
+                            (true, raw_address[5..].to_string())
+                        } else {
+                            (false, raw_address)
+                        };
                         // params[1] is the worker name by stratum convention (the reference
                         // miner sends "worker1"); record it for this connection's breakdown.
                         if let Some(w) = req.params.get(1).and_then(|v| v.as_str()) {
@@ -1261,10 +1416,31 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                         // Strip the UI checksum from the miner's address
                         if let Ok(addr_bytes) = crate::core::types::parse_address_flexible(&address) {
                             authorized_address = Some(addr_bytes);
+                            authorized_solo = state.solo_mode || solo_requested;
                             let res = StratumResponse { id: req.id, result: Some(serde_json::json!(true)), error: None };
                             write_half.write_all(format!("{}\n", serde_json::to_string(&res)?).as_bytes()).await?;
 
-                            if let Some(job) = state.current_job.read().await.clone() {
+                            if authorized_solo {
+                                match build_solo_job(state.clone(), addr_bytes).await {
+                                    Ok(job) => {
+                                        tracing::info!("solo miner authorized: {}", hex::encode(&addr_bytes[..8]));
+                                        solo_job = Some(job.clone());
+                                        let notif = StratumRequest {
+                                            id: None,
+                                            method: "mining.notify".into(),
+                                            params: vec![
+                                                serde_json::json!(job.job_id),
+                                                serde_json::json!(hex::encode(job.mining_hash)),
+                                                serde_json::json!(job.batch_template)
+                                            ]
+                                        };
+                                        write_half.write_all(format!("{}\n", serde_json::to_string(&notif)?).as_bytes()).await?;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("failed to build solo job for {}: {}", hex::encode(&addr_bytes[..8]), e);
+                                    }
+                                }
+                            } else if let Some(job) = state.current_job.read().await.clone() {
                                 let notif = StratumRequest {
                                     id: None,
                                     method: "mining.notify".into(),
@@ -1297,11 +1473,13 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                             let req_id = req.id;
                             let state_for_task = state.clone();
                             let response_tx = response_tx.clone();
+                            let job_for_task = if authorized_solo { solo_job.clone() } else { None };
                             tokio::spawn(async move {
                                 let res = validate_share_submit(
                                     state_for_task,
                                     miner_addr,
                                     worker,
+                                    job_for_task,
                                     req_id,
                                     job_id,
                                     nonce,
@@ -1487,16 +1665,37 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                 }
             }
             Ok(job) = job_rx.recv() => {
-                let notif = StratumRequest {
-                    id: None,
-                    method: "mining.notify".into(),
-                    params: vec![
-                        serde_json::json!(job.job_id),
-                        serde_json::json!(hex::encode(job.mining_hash)),
-                        serde_json::json!(job.batch_template)
-                    ]
+                let notify_job = if authorized_solo {
+                    if let Some(addr) = authorized_address {
+                        match build_solo_job(state.clone(), addr).await {
+                            Ok(job) => {
+                                solo_job = Some(job.clone());
+                                Some(job)
+                            }
+                            Err(e) => {
+                                tracing::warn!("failed to refresh solo job for {}: {}", hex::encode(&addr[..8]), e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(job)
                 };
-                write_half.write_all(format!("{}\n", serde_json::to_string(&notif)?).as_bytes()).await?;
+
+                if let Some(job) = notify_job {
+                    let notif = StratumRequest {
+                        id: None,
+                        method: "mining.notify".into(),
+                        params: vec![
+                            serde_json::json!(job.job_id),
+                            serde_json::json!(hex::encode(job.mining_hash)),
+                            serde_json::json!(job.batch_template)
+                        ]
+                    };
+                    write_half.write_all(format!("{}\n", serde_json::to_string(&notif)?).as_bytes()).await?;
+                }
             }
         }
     }
