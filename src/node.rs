@@ -5,7 +5,7 @@ use crate::core::*;
 use crate::core::types::{CoinbaseOutput, BatchHeader};
 use crate::core::state::{apply_batch, choose_best_state};
 use crate::core::extension::create_extension;
-use crate::core::transaction::{apply_transaction, apply_transaction_no_sig_check, validate_transaction};
+use crate::core::transaction::{apply_transaction, apply_transaction_no_sig_check, validate_transaction, verify_transaction_sigs};
 use crate::mempool::Mempool;
 use crate::metrics::Metrics;
 use crate::mix::{MixManager, MixPhase, MixStatusSnapshot};
@@ -819,7 +819,9 @@ fn build_template_prefix(
         let tx_bytes = bincode::serialized_size(&tx).unwrap_or(0) as u64;
         if current_bytes + tx_bytes > MAX_BLOCK_BYTES { continue; }
 
-        if apply_transaction(&mut candidate, &tx).is_ok() {
+        if verify_transaction_sigs(&tx, candidate.height, &candidate.commitments, &std::collections::HashSet::new()).is_ok()
+            && apply_transaction_no_sig_check(&mut candidate, &tx).is_ok()
+        {
             total_fees    += tx.fee();
             current_bytes += tx_bytes;
             transactions.push(tx);
@@ -886,7 +888,9 @@ fn build_template_prefix(
         }
 
         // 3. Try to apply the transaction
-        if apply_transaction(&mut candidate, &tx).is_ok() {
+        if verify_transaction_sigs(&tx, candidate.height, &candidate.commitments, &std::collections::HashSet::new()).is_ok()
+            && apply_transaction_no_sig_check(&mut candidate, &tx).is_ok()
+        {
             // 4. It succeeded! Now update all the tracking variables
             match &tx {
                 Transaction::Reveal { inputs, outputs, .. } => {
