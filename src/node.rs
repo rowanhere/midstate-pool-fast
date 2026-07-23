@@ -5672,6 +5672,13 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
 
         // Fast pre-checks BEFORE cloning state (O(1) shallow clone via structural sharing).
         if prev_header_hash != self.state.header_hash {
+            if from.is_none() {
+                bail!(
+                    "parent mismatch: template parent {} does not match local tip {}",
+                    hex::encode(prev_header_hash),
+                    hex::encode(self.state.header_hash),
+                );
+            }
             // --- FIX: Prevent Orphan OOM Attack ---
             // 1. Verify the sequential PoW is valid (forces attacker to compute 1M hashes)
             let header = batch.header();
@@ -5747,6 +5754,13 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
 
         if batch.target != self.state.target {
             tracing::debug!("Batch target mismatch, ignoring");
+            if from.is_none() {
+                bail!(
+                    "target mismatch: batch {} vs expected {}",
+                    hex::encode(batch.target),
+                    hex::encode(self.state.target),
+                );
+            }
             //if let Some(peer) = from {
             //    self.ban_peer(peer, "batch target mismatch for current height");
            // }
@@ -5838,6 +5852,9 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
             }
             Err(e) => {
                 tracing::debug!("Batch rejected after full validation: {}", e);
+                if from.is_none() {
+                    return Err(e);
+                }
                 // NOTE: We intentionally do NOT call observe_adversarial() here.
                 // A rejected batch could be simple spam (garbage sigs, no PoW).
                 // The finality estimator models adversarial *hashpower* — only
