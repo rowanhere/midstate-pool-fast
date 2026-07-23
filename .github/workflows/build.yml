@@ -1,130 +1,54 @@
-name: Build Release Binaries
+name: Build Linux Pool Release
 
 on:
   push:
-    branches: [ "main" ]
     tags:
-      - 'v*.*.*'
-  pull_request:
-    branches: [ "main" ]
+      - "v*"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build:
-    name: Build on ${{ matrix.os }} (${{ matrix.artifact_name || matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux (x86_64)
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: midstate-linux-amd64
-            bin_name: midstate
-          
-          # Raspberry Pi 3 & Zero 2 W (Cortex-A53)
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            artifact_name: midstate-rpi3-arm64
-            bin_name: midstate
-            rustflags: "-C target-cpu=cortex-a53 -C link-arg=-lgcc"
-
-          # Raspberry Pi 4 (Cortex-A72)
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            artifact_name: midstate-rpi4-arm64
-            bin_name: midstate
-            rustflags: "-C target-cpu=cortex-a72 -C link-arg=-lgcc"
-
-          # Raspberry Pi 5 (Cortex-A76)
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            artifact_name: midstate-rpi5-arm64
-            bin_name: midstate
-            rustflags: "-C target-cpu=cortex-a76 -C link-arg=-lgcc"
-
-          # Windows (x86_64)
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: midstate-windows-amd64.exe
-            bin_name: midstate.exe
-          
-          # macOS (Intel)
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: midstate-macos-amd64
-            bin_name: midstate
-          
-          # macOS (Apple Silicon / M1 / M2)
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: midstate-macos-arm64
-            bin_name: midstate
-
+  build-linux-amd64:
+    name: Build Linux AMD64
+    runs-on: ubuntu-24.04
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Install Linux Dependencies
-      if: matrix.os == 'ubuntu-latest'
-      run: |
-        sudo apt-get update 
-        sudo apt-get install -y build-essential cmake
-        # Install aarch64 cross-compiler if the target requires it
-        if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-        fi
+      - uses: dtolnay/rust-toolchain@stable
 
-    - name: Install Rust Toolchain
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
 
-    - name: Rust Cache
-      uses: Swatinem/rust-cache@v2
-      with:
-        # Cache keyed by artifact name to prevent the Pi builds from thrashing each other
-        key: ${{ matrix.target }}-${{ matrix.artifact_name }}
+      - name: Build release binary
+        run: cargo build --release
 
-    - name: Build Release
-      env:
-        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        RUSTFLAGS: ${{ matrix.rustflags || '' }}
+      - name: Package
+        run: |
+          cp target/release/midstate midstate-linux-amd64
+          sha256sum midstate-linux-amd64 > SHA256SUMS.txt
 
-      run: cargo build --release --target ${{ matrix.target }}
-
-    - name: Rename Binary for Artifacts (Linux/macOS)
-      if: matrix.os != 'windows-latest'
-      run: mv target/${{ matrix.target }}/release/${{ matrix.bin_name }} target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-
-    - name: Rename Binary for Artifacts (Windows)
-      if: matrix.os == 'windows-latest'
-      run: Rename-Item -Path "target\${{ matrix.target }}\release\${{ matrix.bin_name }}" -NewName "${{ matrix.artifact_name }}"
-
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ matrix.artifact_name }}
-        path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-        if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: midstate-linux-amd64
+          path: |
+            midstate-linux-amd64
+            SHA256SUMS.txt
 
   release:
-    name: Create GitHub Release
-    needs: build
+    name: Publish Linux Release
+    needs: build-linux-amd64
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    runs-on: ubuntu-24.04
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: release
           merge-multiple: true
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          files: |
+            release/midstate-linux-amd64
+            release/SHA256SUMS.txt
           generate_release_notes: true
