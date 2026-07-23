@@ -22,7 +22,7 @@
 //! 5. **Checksum-Agnostic Ingestion**: Strips 4-byte UI checksums from user-supplied 
 //!    addresses before hashing to prevent silent HTTP 400 rejection loops from the core node.
 
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -496,8 +496,10 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
     }
 
     let mut blocks = Vec::new();
+    let mut total_blocks = 0u64;
     if let Ok(read_txn) = state.db.begin_read() {
         if let Ok(table) = read_txn.open_table(BLOCKS_TABLE) {
+            total_blocks = table.len().unwrap_or(0);
             for iter in table.iter().unwrap().rev().take(100) {
                 let (_, data) = iter.unwrap();
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(data.value()) {
@@ -548,6 +550,7 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
         "active_miners": miners.len(),
         "miners": miners,
         "recent_blocks": blocks,
+        "total_blocks": total_blocks,
         // Provably-fair anchor + raw targets for local BigInt math:
         "merkle_root": merkle_root_hex,
         "network_target": network_target_hex,
