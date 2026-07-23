@@ -1344,14 +1344,12 @@ async fn validate_share_submit(
                         let mut table = write_txn.open_table(SHARES_TABLE).unwrap();
                         let mut total_score = 0u128;
                         if solo_submission {
-                            let accepted = submit_state
-                                .share_stats
-                                .read()
-                                .await
-                                .get(&submitting_miner)
-                                .map(|(accepted, _)| *accepted)
-                                .unwrap_or(0);
-                            total_score = accepted as u128;
+                            let workers = submit_state.worker_stats.read().await;
+                            total_score = workers
+                                .iter()
+                                .filter(|((addr, _), _)| *addr == submitting_miner)
+                                .map(|(_, score)| *score as u128)
+                                .sum();
                         } else {
                             for iter in table.iter().unwrap() { total_score += iter.unwrap().1.value() as u128; }
                         }
@@ -1401,6 +1399,13 @@ async fn validate_share_submit(
                         s_table.insert(batch.timestamp, scores_data.as_str()).unwrap();
                     }
                     write_txn.commit().unwrap();
+                    if solo_submission {
+                        submit_state
+                            .worker_stats
+                            .write()
+                            .await
+                            .retain(|(addr, _), _| *addr != submitting_miner);
+                    }
                 }
                 Ok(resp) => {
                     let status = resp.status();
