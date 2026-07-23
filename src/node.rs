@@ -5847,6 +5847,16 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
                     self.try_apply_orphans().await;
                     self.check_pending_mix_reveals().await;
                     self.trigger_mining();
+                } else if from.is_none() {
+                    bail!(
+                        "valid pool candidate lost fork choice: candidate(height={}, depth={}, hash={}) vs local(height={}, depth={}, hash={})",
+                        candidate_state.height,
+                        candidate_state.depth,
+                        hex::encode(batch.extension.final_hash),
+                        self.state.height,
+                        self.state.depth,
+                        hex::encode(self.state.header_hash),
+                    );
                 }
                 Ok(())
             }
