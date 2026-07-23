@@ -1014,6 +1014,42 @@ async fn validate_share_submit(
         }
     };
 
+    // Fast miners may submit a precomputed hash so ordinary shares do not force
+    // the pool CPU through the million-step chain again. A full block candidate
+    // is rare, however, and must be recomputed before it reaches the node: this
+    // turns a generic node-side rejection into a definitive miner/template check.
+    if submitted_hash.is_some() && ext.final_hash < job.network_target {
+        let mining_hash = job.mining_hash;
+        let expected = match tokio::task::spawn_blocking(move || create_extension(mining_hash, nonce)).await {
+            Ok(expected) => expected,
+            Err(e) => {
+                tracing::warn!("block candidate verification task failed: {}", e);
+                state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+                return StratumResponse {
+                    id: req_id,
+                    result: Some(serde_json::json!(false)),
+                    error: Some("Block candidate verification failed".into()),
+                };
+            }
+        };
+
+        if expected.final_hash != ext.final_hash {
+            tracing::warn!(
+                "Rejected invalid GPU block candidate from {}: nonce={} submitted_hash={} recomputed_hash={}",
+                hex::encode(&miner_addr[..8]),
+                nonce,
+                hex::encode(ext.final_hash),
+                hex::encode(expected.final_hash),
+            );
+            state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+            return StratumResponse {
+                id: req_id,
+                result: Some(serde_json::json!(false)),
+                error: Some("Invalid block candidate".into()),
+            };
+        }
+    }
+
     if ext.final_hash >= job.share_target {
         state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
         return StratumResponse {
