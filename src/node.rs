@@ -217,6 +217,7 @@ pub struct NodeHandle {
     /// Mempool snapshot with each transaction's arrival time (unix secs),
     /// refreshed every UI tick. Timestamps feed the explorer's age display.
     mempool_txs: Arc<RwLock<Vec<(Transaction, u64)>>>,
+    recent_headers: Arc<RwLock<VecDeque<u64>>>,
     peer_addrs: Arc<RwLock<Vec<String>>>,
     webrtc_addrs: Arc<RwLock<Vec<String>>>, 
     pub tx_sender: tokio::sync::mpsc::Sender<NodeCommand>,
@@ -362,6 +363,10 @@ impl NodeHandle {
         let size = *self.mempool_size.read().await;
         let txs = self.mempool_txs.read().await.iter().map(|(t, _)| t.clone()).collect();
         (size, txs)
+    }
+
+    pub async fn get_recent_headers(&self) -> Vec<u64> {
+        self.recent_headers.read().await.iter().copied().collect()
     }
 
     /// Like [`get_mempool_info`](Self::get_mempool_info), but pairs each
@@ -2460,6 +2465,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
             safe_depth: Arc::new(RwLock::new(self.finality.calculate_safe_depth(1e-6))),
             mempool_size: Arc::new(RwLock::new(self.mempool.len())),
             mempool_txs: Arc::new(RwLock::new(self.mempool.transactions_with_meta())),
+            recent_headers: Arc::new(RwLock::new(self.recent_headers.clone())),
             peer_addrs: Arc::new(RwLock::new(Vec::new())),
             webrtc_addrs: Arc::new(RwLock::new(Vec::new())),
             tx_sender: tx,
@@ -2768,6 +2774,7 @@ pub fn create_handle(&self) -> (NodeHandle, tokio::sync::mpsc::Receiver<NodeComm
                     *handle.safe_depth.write().await = current_safe_depth;
                     *handle.mempool_size.write().await = self.mempool.len();
                     *handle.mempool_txs.write().await = self.mempool.transactions_with_meta();
+                    *handle.recent_headers.write().await = self.recent_headers.clone();
                     *handle.peer_addrs.write().await = self.network.peer_addrs();
                     // Publish sync status so /state can tell pools/miners to pause.
                     // Same definition the StateInfo handler uses internally.

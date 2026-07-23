@@ -1582,14 +1582,76 @@ pub async fn block_template(
 ) -> Result<Json<crate::rpc::types::BlockTemplateResponse>, ErrorResponse> {
     let state = node.get_state().await;
     let (_, txs) = node.get_mempool_info().await;
+    let recent_headers = node.get_recent_headers().await;
     
-    match crate::node::build_block_template_inner(&state, txs, &req) {
+    match build_checked_block_template(&state, &recent_headers, txs, &req) {
         Ok(resp) => Ok(Json(resp)),
         Err(crate::node::BlockTemplateError::InvalidCoinbase(msg)) => {
             Err(ErrorResponse { error: msg.into() })
         }
         Err(crate::node::BlockTemplateError::CoinbaseTotalMismatch { expected_total, .. }) => {
             Err(ErrorResponse { error: format!("Coinbase mismatch. Expected: {}", expected_total) })
+        }
+    }
+}
+
+fn build_checked_block_template(
+    state: &crate::core::State,
+    recent_headers: &[u64],
+    txs: Vec<Transaction>,
+    req: &crate::rpc::types::BlockTemplateRequest,
+) -> Result<crate::rpc::types::BlockTemplateResponse, crate::node::BlockTemplateError> {
+    let first = crate::node::build_block_template_inner(state, txs, req)?;
+    if template_validates(state, recent_headers, &first) {
+        return Ok(first);
+    }
+
+    tracing::warn!("block_template self-check failed with mempool transactions; retrying coinbase-only template");
+    let fallback = crate::node::build_block_template_inner(state, Vec::new(), req)?;
+    if template_validates(state, recent_headers, &fallback) {
+        return Ok(fallback);
+    }
+
+    tracing::warn!("coinbase-only block_template self-check failed; returning template so caller gets explicit submit error");
+    Ok(fallback)
+}
+
+fn template_validates(
+    state: &crate::core::State,
+    recent_headers: &[u64],
+    resp: &crate::rpc::types::BlockTemplateResponse,
+) -> bool {
+    let batch: crate::core::Batch = match serde_json::from_value(resp.batch_template.clone()) {
+        Ok(batch) => batch,
+        Err(e) => {
+            tracing::warn!("block_template self-check could not decode template batch: {}", e);
+            return false;
+        }
+    };
+
+    let mut candidate = state.clone();
+    let mining_hash = match hex::decode(resp.mining_midstate.as_bytes())
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+    {
+        Some(hash) => hash,
+        None => {
+            tracing::warn!("block_template self-check found invalid mining_midstate");
+            return false;
+        }
+    };
+
+    match crate::core::state::apply_batch_skip_pow(
+        &mut candidate,
+        &batch,
+        recent_headers,
+        &mut std::collections::HashMap::new(),
+        mining_hash,
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("block_template self-check rejected template: {}", e);
+            false
         }
     }
 }
