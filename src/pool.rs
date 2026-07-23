@@ -822,6 +822,9 @@ pub async fn run_stratum_pool(
                 std::sync::atomic::Ordering::Relaxed,
             );
 
+            let force_new_job = !current_tip.is_empty()
+                && state_clone.force_new_job.swap(false, std::sync::atomic::Ordering::SeqCst);
+
             if state_clone.solo_mode {
                 if let Some(t_hex) = net_state["target"].as_str() {
                     let mut template_target = [0u8; 32];
@@ -835,7 +838,13 @@ pub async fn run_stratum_pool(
                             height: tip_height.saturating_add(1),
                             committed_scores: Arc::new(Vec::new()),
                         };
-                        *state_clone.current_job.write().await = Some(job);
+                        *state_clone.current_job.write().await = Some(job.clone());
+                        if (current_tip != last_network_tip || force_new_job) && !current_tip.is_empty() {
+                            last_network_tip = current_tip.clone();
+                            state_clone.valid_shares.write().await.clear();
+                            let _ = state_clone.job_notifier.send(job);
+                            tracing::info!("solo tip changed; refreshing connected solo miners");
+                        }
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -848,9 +857,6 @@ pub async fn run_stratum_pool(
             // usable tip, so a request that races an empty /state response isn't
             // silently lost. (If template building fails below, `last_network_tip`
             // is cleared, which guarantees a retry on the next poll regardless.)
-            let force_new_job = !current_tip.is_empty()
-                && state_clone.force_new_job.swap(false, std::sync::atomic::Ordering::SeqCst);
-
             if (current_tip != last_network_tip || force_new_job) && !current_tip.is_empty() {
                 job_counter += 1;
                 last_network_tip = current_tip.clone();
