@@ -1319,6 +1319,7 @@ async fn validate_share_submit(
         let rpc_url = state.node_rpc_url.clone();
         let submit_state = state.clone();
         let solo_submission = is_solo;
+        let submitting_miner = miner_addr;
 
         tokio::spawn(async move {
             let res = reqwest::Client::new().post(&format!("{}/submit_batch", rpc_url))
@@ -1336,7 +1337,18 @@ async fn validate_share_submit(
                     {
                         let mut table = write_txn.open_table(SHARES_TABLE).unwrap();
                         let mut total_score = 0u128;
-                        for iter in table.iter().unwrap() { total_score += iter.unwrap().1.value() as u128; }
+                        if solo_submission {
+                            let accepted = submit_state
+                                .share_stats
+                                .read()
+                                .await
+                                .get(&submitting_miner)
+                                .map(|(accepted, _)| *accepted)
+                                .unwrap_or(0);
+                            total_score = accepted as u128;
+                        } else {
+                            for iter in table.iter().unwrap() { total_score += iter.unwrap().1.value() as u128; }
+                        }
 
                         let mut payouts = Vec::new();
                         for cb in &batch.coinbase {
