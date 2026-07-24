@@ -2117,10 +2117,9 @@ async fn handle_light_request(
                     return LightResponse::error("Node is currently overloaded, please try again");
                 }
 
-                // Bound the wait so a stuck node loop can never hang a light client.
-                // 5s is generous: handle_new_batch verifies PoW (~1ms), applies
-                // transactions, and writes the batch — all comfortably sub-second.
-                match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
+                // Bound the wait so a stuck node loop can never hang a light client,
+                // while still giving busy mined-block validation enough room to finish.
+                match tokio::time::timeout(std::time::Duration::from_secs(60), ack_rx).await {
                     Ok(Ok(Ok(()))) => LightResponse::success(serde_json::json!({ "accepted": true })),
                     Ok(Ok(Err(e))) => LightResponse::error(format!("Block rejected: {}", e)),
                     Ok(Err(_))     => LightResponse::error("Node dropped submission ack"),

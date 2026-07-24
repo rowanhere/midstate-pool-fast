@@ -147,7 +147,7 @@ impl RpcServer {
             // 16 MB clears the worst legal block with headroom and also covers a maximal
             // multi-KB-witness reveal near MAX_TX_INPUTS.
             .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
-            .layer(TimeoutLayer::new(Duration::from_secs(30))) // Forcefully drop stalled requests
+            .layer(TimeoutLayer::new(Duration::from_secs(120))) // Forcefully drop stalled requests
             .layer(TraceLayer::new_for_http())
             .layer(cors)
             .with_state(node_handle);

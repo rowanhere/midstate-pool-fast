@@ -1439,7 +1439,7 @@ pub async fn submit_batch(
         return Err(ErrorResponse { error: "Node is currently overloaded".into() });
     }
 
-    match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(60), ack_rx).await {
         Ok(Ok(Ok(()))) => Ok(Json(serde_json::json!({ "accepted": true }))),
         Ok(Ok(Err(e))) => Err(ErrorResponse { error: format!("Block rejected: {}", e) }),
         Ok(Err(_))     => Err(ErrorResponse { error: "Node dropped submission ack".into() }),
