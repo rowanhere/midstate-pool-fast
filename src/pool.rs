@@ -218,6 +218,7 @@ struct PoolState {
     force_new_job: std::sync::atomic::AtomicBool,
     solo_job_counter: std::sync::atomic::AtomicU64,
     solo_mode: bool,
+    http_solo_jobs: RwLock<HashMap<[u8; 32], Job>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,12 +276,21 @@ async fn get_http_work(
     State(state): State<Arc<PoolState>>,
     Query(query): Query<HttpWorkQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    crate::core::types::parse_address_flexible(&query.address)
+    let miner_addr = crate::core::types::parse_address_flexible(&query.address)
         .map_err(|_| (StatusCode::BAD_REQUEST, "invalid address".to_string()))?;
     let _ = (&query.worker, &query.sig);
 
-    let job = state.current_job.read().await.clone()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no mining job".to_string()))?;
+    let job = if state.solo_mode {
+        let job = build_solo_job(state.clone(), miner_addr)
+            .await
+            .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+        state.http_solo_jobs.write().await.insert(miner_addr, job.clone());
+        job
+    } else {
+        state.current_job.read().await.clone()
+            .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no mining job".to_string()))?
+    };
+
     Ok(Json(serde_json::json!({
         "job_id": job.job_id.to_string(),
         "height": job.height,
@@ -318,17 +328,27 @@ async fn post_http_share(
         Err(_) => return (StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "accepted": false, "error": "invalid address" }))),
     };
-    let job_id = match state.current_job.read().await.as_ref() {
-        Some(job) => job.job_id,
-        None => return (StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "accepted": false, "error": "no mining job" }))),
+    let solo_job = if state.solo_mode {
+        state.http_solo_jobs.read().await.get(&miner_addr).cloned()
+    } else {
+        None
+    };
+
+    let job_id = if let Some(job) = solo_job.as_ref() {
+        job.job_id
+    } else {
+        match state.current_job.read().await.as_ref() {
+            Some(job) => job.job_id,
+            None => return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "accepted": false, "error": "no mining job" }))),
+        }
     };
 
     let response = validate_share_submit(
         state,
         miner_addr,
         "http-native".to_string(),
-        None,
+        solo_job,
         None,
         job_id,
         request.batch.extension.nonce,
@@ -718,6 +738,7 @@ pub async fn run_stratum_pool(
                 .unwrap_or(0)
         ),
         solo_mode: pool_mode == PoolMode::Solo,
+        http_solo_jobs: RwLock::new(HashMap::new()),
     });
 
     let api_state = state.clone();
