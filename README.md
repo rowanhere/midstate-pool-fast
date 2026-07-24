@@ -169,6 +169,22 @@ Do not run two pool processes against the same `data/pool_stratum.redb` file.
 The pool pays miners directly in a found block's coinbase according to their
 credited shares; `pool-wallet.dat` is not used to send those miner payouts.
 
+### Telegram watchdog
+
+Run the watcher in another tmux pane or as a systemd service to get Telegram
+alerts when the node, pool, or solo logs emit error-like lines:
+
+```bash
+export TELEGRAM_BOT_TOKEN='<bot token>'
+export TELEGRAM_CHAT_ID='<chat id>'
+export WATCHDOG_LOGS='node:/root/midstate-node.log,pool:/root/midstate-pool.log,solo:/root/midstate-solo.log'
+
+python3 scripts/telegram-watchdog.py
+```
+
+The watcher starts at the end of each log by default, so it only alerts on new
+issues. Adjust `WATCHDOG_MATCH` if you want a stricter or looser filter.
+
 ### Access the pool dashboard
 
 Copy the public HTTPS URL shown by Clore for the container's `8081 HTTP`
