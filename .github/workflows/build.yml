@@ -21,17 +21,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release
+        run: |
+          cargo clean
+          cargo build --release
 
       - name: Package
         run: |
+          cp target/release/midstate midstate-pool-fast-linux-amd64
           cp target/release/midstate midstate-linux-amd64
-          sha256sum midstate-linux-amd64 > SHA256SUMS.txt
+          sha256sum midstate-pool-fast-linux-amd64 midstate-linux-amd64 > SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: midstate-linux-amd64
           path: |
+            midstate-pool-fast-linux-amd64
             midstate-linux-amd64
             SHA256SUMS.txt
 
@@ -49,6 +53,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
+            release/midstate-pool-fast-linux-amd64
             release/midstate-linux-amd64
             release/SHA256SUMS.txt
           generate_release_notes: true
