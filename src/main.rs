@@ -109,6 +109,7 @@ fn default_wallet_path() -> PathBuf {
 
 #[derive(Parser)]
 #[command(name = "midstate")]
+#[command(version)]
 #[command(about = "A minimal sequential-time cryptocurrency", long_about = None)]
 struct Cli {
     #[command(subcommand)]

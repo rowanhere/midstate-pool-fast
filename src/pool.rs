@@ -47,6 +47,7 @@ const BLOCKS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("blocks");
 /// /pool/stats payload stays lean; served on demand via /api/block_scores for
 /// historical split-verification (proving each payout was proportional to score).
 const BLOCK_SCORES_TABLE: TableDefinition<u64, &str> = TableDefinition::new("block_scores");
+const POOL_STATS_SCHEMA_VERSION: u64 = 2;
 
 // ── Stratum Protocol Types ──────────────────────────────────────────────────
 
@@ -611,6 +612,8 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
 
     Json(serde_json::json!({
         "pool_fee_percent": state.pool_fee_percent,
+        "stats_schema_version": POOL_STATS_SCHEMA_VERSION,
+        "worker_activity_supported": true,
         "total_score": total_score,
         "active_miners": miners.len(),
         "miners": miners,
