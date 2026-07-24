@@ -204,6 +204,8 @@ struct PoolState {
     /// Cumulative accepted shares per (address, worker-name). A pure stats layer for
     /// per-rig breakdown; payout accounting stays strictly per-address and is untouched.
     worker_stats: RwLock<HashMap<([u8; 32], String), u64>>,
+    /// Last accepted share timestamp per (address, worker-name), Unix seconds.
+    worker_last_share: RwLock<HashMap<([u8; 32], String), u64>>,
     /// Limits concurrent full Midstate extension validations so GPU miners can submit
     /// ahead without pinning the Stratum socket loop.
     share_verify_sem: Arc<Semaphore>,
@@ -504,12 +506,14 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
     let mut solo_scores: HashMap<[u8; 32], u64> = HashMap::new();
     {
         let ws = state.worker_stats.read().await;
+        let last_seen = state.worker_last_share.read().await;
         for ((addr, name), count) in ws.iter() {
             *solo_scores.entry(*addr).or_insert(0) += *count;
             workers.push(serde_json::json!({
                 "address": crate::core::types::encode_address_with_checksum(addr),
                 "worker": name,
-                "score": count
+                "score": count,
+                "last_share_at": last_seen.get(&(*addr, name.clone())).copied().unwrap_or(0)
             }));
         }
     }
@@ -728,6 +732,7 @@ pub async fn run_stratum_pool(
         current_height: std::sync::atomic::AtomicU64::new(0),
         share_stats: RwLock::new(HashMap::new()),
         worker_stats: RwLock::new(HashMap::new()),
+        worker_last_share: RwLock::new(HashMap::new()),
         share_verify_sem: Arc::new(Semaphore::new(share_verify_workers)),
         db_write_lock: Mutex::new(()),
         force_new_job: std::sync::atomic::AtomicBool::new(false),
@@ -1326,6 +1331,13 @@ async fn validate_share_submit(
 
     state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).0 += 1;
     *state.worker_stats.write().await.entry((miner_addr, authorized_worker.clone())).or_insert(0) += 1;
+    state.worker_last_share.write().await.insert(
+        (miner_addr, authorized_worker.clone()),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0),
+    );
 
     if ext.final_hash < job.network_target {
         tracing::info!("block found by miner {}. submitting to network.", hex::encode(&miner_addr[..8]));
@@ -1401,6 +1413,7 @@ async fn validate_share_submit(
                             "block_ts": batch.timestamp,
                             "hash": block_hash_hex,
                             "height": block_height,
+                            "worker": authorized_worker,
                             "total_score": total_score as u64,
                             "net_target": block_net_target_hex,
                             "payouts": payouts
@@ -1423,6 +1436,11 @@ async fn validate_share_submit(
                     if solo_submission {
                         submit_state
                             .worker_stats
+                            .write()
+                            .await
+                            .retain(|(addr, _), _| *addr != submitting_miner);
+                        submit_state
+                            .worker_last_share
                             .write()
                             .await
                             .retain(|(addr, _), _| *addr != submitting_miner);
