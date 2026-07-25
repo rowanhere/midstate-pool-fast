@@ -886,12 +886,41 @@ pub async fn run_stratum_pool(
             // usable tip, so a request that races an empty /state response isn't
             // silently lost. (If template building fails below, `last_network_tip`
             // is cleared, which guarantees a retry on the next poll regardless.)
-            if (current_tip != last_network_tip || force_new_job) && !current_tip.is_empty() {
+            let tip_changed = current_tip != last_network_tip;
+            if (tip_changed || force_new_job) && !current_tip.is_empty() {
                 job_counter += 1;
                 last_network_tip = current_tip.clone();
 
                 // Clear the replay cache for the new block
                 state_clone.valid_shares.write().await.clear();
+
+                if tip_changed {
+                    let _db_guard = state_clone.db_write_lock.lock().await;
+                    if let Ok(write_txn) = state_clone.db.begin_write() {
+                        if let Ok(mut table) = write_txn.open_table(SHARES_TABLE) {
+                            let stale: Vec<[u8; 32]> = table
+                                .iter()
+                                .unwrap()
+                                .filter_map(|iter| {
+                                    let (addr, _) = iter.unwrap();
+                                    let mut a = [0u8; 32];
+                                    a.copy_from_slice(addr.value());
+                                    Some(a)
+                                })
+                                .collect();
+                            let purged = stale.len();
+                            for a in stale {
+                                table.remove(&a).unwrap();
+                            }
+                            if purged > 0 {
+                                tracing::info!("round reset on new chain tip: cleared {} miner score row(s)", purged);
+                            }
+                        }
+                        write_txn.commit().unwrap();
+                    }
+                    state_clone.worker_stats.write().await.clear();
+                    state_clone.worker_last_share.write().await.clear();
+                }
 
                 // Only positive-score rows are eligible for reward. A stale `score == 0`
                 // row (e.g. the pool fee address, or a miner whose score was fully
@@ -1330,6 +1359,7 @@ async fn validate_share_submit(
                 error: Some("DB commit error".into()),
             };
         }
+        state.force_new_job.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).0 += 1;
@@ -1356,7 +1386,6 @@ async fn validate_share_submit(
             }
         };
         batch.extension = ext;
-        let total_reward: u64 = batch.coinbase.iter().map(|cb| cb.value).sum();
         let batch_for_node = batch.clone();
         let rpc_url = state.node_rpc_url.clone();
         let submit_state = state.clone();
@@ -1372,42 +1401,46 @@ async fn validate_share_submit(
                     if solo_submission {
                         tracing::info!("solo block accepted by network. retaining shared pool scores.");
                     } else {
-                        tracing::info!("block accepted by network. applying score deductions.");
+                        tracing::info!("block accepted by network. clearing round scores.");
                     }
                     let _db_guard = submit_state.db_write_lock.lock().await;
                     let write_txn = submit_state.db.begin_write().unwrap();
                     {
                         let mut table = write_txn.open_table(SHARES_TABLE).unwrap();
-                        let mut total_score = 0u128;
-                        if solo_submission {
+                        let total_score: u128 = if solo_submission {
                             let workers = submit_state.worker_stats.read().await;
-                            total_score = workers
+                            workers
                                 .iter()
                                 .filter(|((addr, _), _)| *addr == submitting_miner)
                                 .map(|(_, score)| *score as u128)
-                                .sum();
+                                .sum()
                         } else {
-                            for iter in table.iter().unwrap() { total_score += iter.unwrap().1.value() as u128; }
-                        }
+                            committed_scores.iter().map(|(_, score)| *score as u128).sum()
+                        };
 
                         let mut payouts = Vec::new();
                         for cb in &batch.coinbase {
                             let mut a = [0u8; 32]; a.copy_from_slice(&cb.address);
-                            if !solo_submission && total_reward > 0 {
-                                let deduction = ((cb.value as u128 * total_score) / (total_reward as u128)) as u64;
-                                if let Some(current) = table.get(&a).unwrap().map(|v| v.value()) {
-                                    let remaining = current.saturating_sub(deduction);
-                                    if remaining > 0 {
-                                        table.insert(&a, remaining).unwrap();
-                                    } else {
-                                        table.remove(&a).unwrap();
-                                    }
-                                }
-                            }
                             payouts.push(serde_json::json!({
                                 "address": crate::core::types::encode_address_with_checksum(&a),
                                 "value": cb.value
                             }));
+                        }
+
+                        if !solo_submission {
+                            let stale: Vec<[u8; 32]> = table
+                                .iter()
+                                .unwrap()
+                                .filter_map(|iter| {
+                                    let (addr, _) = iter.unwrap();
+                                    let mut a = [0u8; 32];
+                                    a.copy_from_slice(addr.value());
+                                    Some(a)
+                                })
+                                .collect();
+                            for a in stale {
+                                table.remove(&a).unwrap();
+                            }
                         }
 
                         let mut b_table = write_txn.open_table(BLOCKS_TABLE).unwrap();
@@ -1447,6 +1480,9 @@ async fn validate_share_submit(
                             .write()
                             .await
                             .retain(|(addr, _), _| *addr != submitting_miner);
+                    } else {
+                        submit_state.worker_stats.write().await.clear();
+                        submit_state.worker_last_share.write().await.clear();
                     }
                 }
                 Ok(resp) => {
