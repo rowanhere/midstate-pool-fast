@@ -1,6 +1,6 @@
 [package]
 name = "midstate"
-version = "4.0.0-fast.20"
+version = "4.0.0-fast.21"
 edition = "2021"
 
 [dependencies]

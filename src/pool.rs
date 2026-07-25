@@ -957,10 +957,6 @@ pub async fn run_stratum_pool(
                 // Clear the replay cache for the new block
                 state_clone.valid_shares.write().await.clear();
 
-                if tip_changed {
-                    state_clone.last_score_refresh.store(0, std::sync::atomic::Ordering::SeqCst);
-                }
-
                 // Only positive-score rows are eligible for reward. A stale `score == 0`
                 // row (e.g. the pool fee address, or a miner whose score was fully
                 // consumed and never removed) contributes no work and MUST NOT enter the
@@ -1089,6 +1085,9 @@ pub async fn run_stratum_pool(
                         };
 
                         *state_clone.current_job.write().await = Some(job.clone());
+                        state_clone
+                            .last_score_refresh
+                            .store(unix_now_secs(), std::sync::atomic::Ordering::SeqCst);
                         let _ = state_clone.job_notifier.send(job);
                         tracing::info!("new job {}: root {}", job_counter, hex::encode(&tree.root[..8]));
                     }
