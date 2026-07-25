@@ -54,7 +54,7 @@ const POOL_STATS_SCHEMA_VERSION: u64 = 2;
 const PPLNS_WINDOW_SECS: u64 = 60 * 60;
 const ACTIVE_WINDOW_SECS: u64 = 5 * 60;
 const PPLNS_BUCKET_SECS: u64 = 60;
-const SCORE_REFRESH_MIN_SECS: u64 = 30;
+const SCORE_REFRESH_MIN_SECS: u64 = 60;
 
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
