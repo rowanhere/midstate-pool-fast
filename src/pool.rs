@@ -39,6 +39,9 @@ use crate::core::extension::create_extension;
 /// The database table storing the cumulative scores of all miners.
 /// Key: 32-byte cryptographic address hash. Value: u64 share count.
 const SHARES_TABLE: TableDefinition<&[u8; 32], u64> = TableDefinition::new("shares");
+/// Timestamped score buckets for rolling PPLNS payout accounting.
+/// Key format: "{minute_bucket:016x}:{address_hex}". Value: share count.
+const PPLNS_SHARES_TABLE: TableDefinition<&str, u64> = TableDefinition::new("pplns_shares_v1");
 /// The database table storing historical blocks found and their exact payouts.
 /// Key: Block timestamp (u64). Value: JSON string of payouts.
 const BLOCKS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("blocks");
@@ -48,6 +51,51 @@ const BLOCKS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("blocks");
 /// historical split-verification (proving each payout was proportional to score).
 const BLOCK_SCORES_TABLE: TableDefinition<u64, &str> = TableDefinition::new("block_scores");
 const POOL_STATS_SCHEMA_VERSION: u64 = 2;
+const PPLNS_WINDOW_SECS: u64 = 60 * 60;
+const ACTIVE_WINDOW_SECS: u64 = 5 * 60;
+const PPLNS_BUCKET_SECS: u64 = 60;
+const SCORE_REFRESH_MIN_SECS: u64 = 30;
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn pplns_bucket(ts: u64) -> u64 {
+    ts / PPLNS_BUCKET_SECS
+}
+
+fn pplns_key(bucket: u64, addr: &[u8; 32]) -> String {
+    format!("{:016x}:{}", bucket, hex::encode(addr))
+}
+
+fn parse_pplns_key(key: &str) -> Option<(u64, [u8; 32])> {
+    let (bucket_hex, addr_hex) = key.split_once(':')?;
+    let bucket = u64::from_str_radix(bucket_hex, 16).ok()?;
+    let mut addr = [0u8; 32];
+    hex::decode_to_slice(addr_hex, &mut addr).ok()?;
+    Some((bucket, addr))
+}
+
+fn load_pplns_scores(db: &Database, now: u64) -> Vec<([u8; 32], u64)> {
+    let cutoff_bucket = pplns_bucket(now.saturating_sub(PPLNS_WINDOW_SECS));
+    let mut scores: HashMap<[u8; 32], u64> = HashMap::new();
+    if let Ok(read_txn) = db.begin_read() {
+        if let Ok(table) = read_txn.open_table(PPLNS_SHARES_TABLE) {
+            for iter in table.iter().unwrap() {
+                let (key, score) = iter.unwrap();
+                if let Some((bucket, addr)) = parse_pplns_key(key.value()) {
+                    if bucket >= cutoff_bucket {
+                        *scores.entry(addr).or_insert(0) += score.value();
+                    }
+                }
+            }
+        }
+    }
+    scores.into_iter().filter(|(_, score)| *score > 0).collect()
+}
 
 // ── Stratum Protocol Types ──────────────────────────────────────────────────
 
@@ -219,6 +267,10 @@ struct PoolState {
     /// template loop would never rebuild and miners would re-grind the same doomed
     /// template forever. Consumed (cleared) by the polling loop when it rebuilds.
     force_new_job: std::sync::atomic::AtomicBool,
+    /// Last time an accepted share requested a score-refresh job. Round score
+    /// updates need fresh templates, but refreshing on every share can invalidate
+    /// GPU batches faster than miners finish them.
+    last_score_refresh: std::sync::atomic::AtomicU64,
     solo_job_counter: std::sync::atomic::AtomicU64,
     solo_mode: bool,
     http_solo_jobs: RwLock<HashMap<[u8; 32], Job>>,
@@ -505,16 +557,23 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
     // Per-(address, worker) accepted-share tallies for the rig breakdown.
     let mut workers = Vec::new();
     let mut solo_scores: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut active_miners = HashSet::new();
+    let active_cutoff = unix_now_secs().saturating_sub(ACTIVE_WINDOW_SECS);
     {
         let ws = state.worker_stats.read().await;
         let last_seen = state.worker_last_share.read().await;
         for ((addr, name), count) in ws.iter() {
             *solo_scores.entry(*addr).or_insert(0) += *count;
+            let last_share_at = last_seen.get(&(*addr, name.clone())).copied().unwrap_or(0);
+            if last_share_at < active_cutoff {
+                continue;
+            }
+            active_miners.insert(*addr);
             workers.push(serde_json::json!({
                 "address": crate::core::types::encode_address_with_checksum(addr),
                 "worker": name,
                 "score": count,
-                "last_share_at": last_seen.get(&(*addr, name.clone())).copied().unwrap_or(0)
+                "last_share_at": last_share_at
             }));
         }
     }
@@ -532,22 +591,23 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
                 total_score += *s;
             }
         }
-    } else if let Ok(read_txn) = state.db.begin_read() {
-        if let Ok(table) = read_txn.open_table(SHARES_TABLE) {
-            for iter in table.iter().unwrap() {
-                let (addr, score) = iter.unwrap();
-                let mut a = [0u8; 32];
-                a.copy_from_slice(addr.value());
-                let s = score.value();
-                if s > 0 {
-                    let (accepted, rejected) = share_snapshot.get(&a).copied().unwrap_or((0, 0));
-                    miners.push(serde_json::json!({
-                        "address": crate::core::types::encode_address_with_checksum(&a),
-                        "score": s,
-                        "accepted": accepted,
-                        "rejected": rejected
-                    }));
-                    total_score += s;
+    } else {
+        for (a, s) in load_pplns_scores(&state.db, unix_now_secs()) {
+            let (accepted, rejected) = share_snapshot.get(&a).copied().unwrap_or((0, 0));
+            miners.push(serde_json::json!({
+                "address": crate::core::types::encode_address_with_checksum(&a),
+                "score": s,
+                "accepted": accepted,
+                "rejected": rejected
+            }));
+            total_score += s;
+        }
+        if active_miners.is_empty() {
+            for worker in &workers {
+                if let Some(address) = worker["address"].as_str() {
+                    if let Ok(addr) = crate::core::types::parse_address_flexible(address) {
+                        active_miners.insert(addr);
+                    }
                 }
             }
         }
@@ -615,7 +675,7 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
         "stats_schema_version": POOL_STATS_SCHEMA_VERSION,
         "worker_activity_supported": true,
         "total_score": total_score,
-        "active_miners": miners.len(),
+        "active_miners": active_miners.len(),
         "miners": miners,
         "recent_blocks": blocks,
         "total_blocks": total_blocks,
@@ -677,7 +737,9 @@ pub async fn run_stratum_pool(
     let write_txn = db.begin_write().unwrap();
     {
         let mut shares = write_txn.open_table(SHARES_TABLE).unwrap();
+        let _ = write_txn.open_table(PPLNS_SHARES_TABLE).unwrap();
         let _ = write_txn.open_table(BLOCKS_TABLE).unwrap();
+        let _ = write_txn.open_table(BLOCK_SCORES_TABLE).unwrap();
 
         // ── One-off migration: purge stale zero-score rows ──
         // Databases written by affected versions accumulated permanent `score == 0`
@@ -739,6 +801,7 @@ pub async fn run_stratum_pool(
         share_verify_sem: Arc::new(Semaphore::new(share_verify_workers)),
         db_write_lock: Mutex::new(()),
         force_new_job: std::sync::atomic::AtomicBool::new(false),
+        last_score_refresh: std::sync::atomic::AtomicU64::new(0),
         solo_job_counter: std::sync::atomic::AtomicU64::new(
             (1u64 << 63) | std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -895,31 +958,7 @@ pub async fn run_stratum_pool(
                 state_clone.valid_shares.write().await.clear();
 
                 if tip_changed {
-                    let _db_guard = state_clone.db_write_lock.lock().await;
-                    if let Ok(write_txn) = state_clone.db.begin_write() {
-                        if let Ok(mut table) = write_txn.open_table(SHARES_TABLE) {
-                            let stale: Vec<[u8; 32]> = table
-                                .iter()
-                                .unwrap()
-                                .filter_map(|iter| {
-                                    let (addr, _) = iter.unwrap();
-                                    let mut a = [0u8; 32];
-                                    a.copy_from_slice(addr.value());
-                                    Some(a)
-                                })
-                                .collect();
-                            let purged = stale.len();
-                            for a in stale {
-                                table.remove(&a).unwrap();
-                            }
-                            if purged > 0 {
-                                tracing::info!("round reset on new chain tip: cleared {} miner score row(s)", purged);
-                            }
-                        }
-                        write_txn.commit().unwrap();
-                    }
-                    state_clone.worker_stats.write().await.clear();
-                    state_clone.worker_last_share.write().await.clear();
+                    state_clone.last_score_refresh.store(0, std::sync::atomic::Ordering::SeqCst);
                 }
 
                 // Only positive-score rows are eligible for reward. A stale `score == 0`
@@ -931,21 +970,8 @@ pub async fn run_stratum_pool(
                 // distribution. Filtering here also keeps zero-score leaves out of the
                 // Merkle tree and the committed-score snapshot, so the precommitment only
                 // ever commits to addresses that actually worked the round.
-                let mut shares_vec = Vec::new();
-                let mut total_score = 0u128;
-                if let Ok(read_txn) = state_clone.db.begin_read() {
-                    if let Ok(table) = read_txn.open_table(SHARES_TABLE) {
-                        for iter in table.iter().unwrap() {
-                            let (addr, score) = iter.unwrap();
-                            let s = score.value();
-                            if s == 0 { continue; }
-                            let mut a = [0u8; 32];
-                            a.copy_from_slice(addr.value());
-                            shares_vec.push((a, s));
-                            total_score += s as u128;
-                        }
-                    }
-                }
+                let shares_vec = load_pplns_scores(&state_clone.db, unix_now_secs());
+                let total_score: u128 = shares_vec.iter().map(|(_, score)| *score as u128).sum();
 
                 let tree = ShareMerkleTree::build(shares_vec.clone());
                 *state_clone.current_tree.write().await = tree.clone();
@@ -1303,6 +1329,10 @@ async fn validate_share_submit(
 
     if !is_solo {
         let _db_guard = state.db_write_lock.lock().await;
+        let now = unix_now_secs();
+        let bucket = pplns_bucket(now);
+        let key = pplns_key(bucket, &miner_addr);
+        let stale_cutoff = pplns_bucket(now.saturating_sub(PPLNS_WINDOW_SECS + PPLNS_BUCKET_SECS));
         let write_txn = match state.db.begin_write() {
             Ok(txn) => txn,
             Err(e) => {
@@ -1316,7 +1346,7 @@ async fn validate_share_submit(
             }
         };
         {
-            let mut table = match write_txn.open_table(SHARES_TABLE) {
+            let mut table = match write_txn.open_table(PPLNS_SHARES_TABLE) {
                 Ok(table) => table,
                 Err(e) => {
                     tracing::warn!("share score db table open failed: {}", e);
@@ -1328,7 +1358,7 @@ async fn validate_share_submit(
                     };
                 }
             };
-            let current = match table.get(&miner_addr) {
+            let current = match table.get(key.as_str()) {
                 Ok(value) => value.map(|v| v.value()).unwrap_or(0),
                 Err(e) => {
                     tracing::warn!("share score db read failed: {}", e);
@@ -1340,7 +1370,7 @@ async fn validate_share_submit(
                     };
                 }
             };
-            if let Err(e) = table.insert(&miner_addr, current + 1) {
+            if let Err(e) = table.insert(key.as_str(), current + 1) {
                 tracing::warn!("share score db write failed: {}", e);
                 state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
                 return StratumResponse {
@@ -1349,6 +1379,20 @@ async fn validate_share_submit(
                     error: Some("DB write error".into()),
                 };
             };
+
+            let stale: Vec<String> = table
+                .iter()
+                .unwrap()
+                .filter_map(|iter| {
+                    let (key, _) = iter.unwrap();
+                    let key = key.value();
+                    let (bucket, _) = parse_pplns_key(key)?;
+                    (bucket < stale_cutoff).then(|| key.to_string())
+                })
+                .collect();
+            for key in stale {
+                table.remove(key.as_str()).unwrap();
+            }
         }
         if let Err(e) = write_txn.commit() {
             tracing::warn!("share score db commit failed: {}", e);
@@ -1359,7 +1403,20 @@ async fn validate_share_submit(
                 error: Some("DB commit error".into()),
             };
         }
-        state.force_new_job.store(true, std::sync::atomic::Ordering::SeqCst);
+        let last_refresh = state.last_score_refresh.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last_refresh) >= SCORE_REFRESH_MIN_SECS
+            && state
+                .last_score_refresh
+                .compare_exchange(
+                    last_refresh,
+                    now,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            state.force_new_job.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).0 += 1;
@@ -1401,12 +1458,12 @@ async fn validate_share_submit(
                     if solo_submission {
                         tracing::info!("solo block accepted by network. retaining shared pool scores.");
                     } else {
-                        tracing::info!("block accepted by network. clearing round scores.");
+                        tracing::info!("block accepted by network. retaining rolling 1h PPLNS scores.");
                     }
                     let _db_guard = submit_state.db_write_lock.lock().await;
                     let write_txn = submit_state.db.begin_write().unwrap();
                     {
-                        let mut table = write_txn.open_table(SHARES_TABLE).unwrap();
+                        let mut table = write_txn.open_table(PPLNS_SHARES_TABLE).unwrap();
                         let total_score: u128 = if solo_submission {
                             let workers = submit_state.worker_stats.read().await;
                             workers
@@ -1428,18 +1485,19 @@ async fn validate_share_submit(
                         }
 
                         if !solo_submission {
-                            let stale: Vec<[u8; 32]> = table
+                            let stale_cutoff = pplns_bucket(unix_now_secs().saturating_sub(PPLNS_WINDOW_SECS + PPLNS_BUCKET_SECS));
+                            let stale: Vec<String> = table
                                 .iter()
                                 .unwrap()
                                 .filter_map(|iter| {
-                                    let (addr, _) = iter.unwrap();
-                                    let mut a = [0u8; 32];
-                                    a.copy_from_slice(addr.value());
-                                    Some(a)
+                                    let (key, _) = iter.unwrap();
+                                    let key = key.value();
+                                    let (bucket, _) = parse_pplns_key(key)?;
+                                    (bucket < stale_cutoff).then(|| key.to_string())
                                 })
                                 .collect();
-                            for a in stale {
-                                table.remove(&a).unwrap();
+                            for key in stale {
+                                table.remove(key.as_str()).unwrap();
                             }
                         }
 
@@ -1481,8 +1539,7 @@ async fn validate_share_submit(
                             .await
                             .retain(|(addr, _), _| *addr != submitting_miner);
                     } else {
-                        submit_state.worker_stats.write().await.clear();
-                        submit_state.worker_last_share.write().await.clear();
+                        submit_state.last_score_refresh.store(0, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
                 Ok(resp) => {
