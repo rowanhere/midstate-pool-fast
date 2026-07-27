@@ -1,27 +1,33 @@
 //! # Provably Fair Stratum Pool
 //!
-//! This module implements a decentralized-auditable mining pool. Unlike traditional 
-//! Stratum pools where miners must blindly trust the operator to report shares and 
-//! distribute rewards fairly, this pool embeds an SPV-style **Merkle Precommitment** 
+//! This module implements a decentralized-auditable mining pool. Unlike traditional
+//! Stratum pools where miners must blindly trust the operator to report shares and
+//! distribute rewards fairly, this pool embeds an SPV-style **Merkle Precommitment**
 //! into every block template.
 //!
-//! Miners can query the HTTP Audit API (`/api/proof`) to receive a cryptographic 
-//! proof that their exact accumulated score was included in the block's coinbase 
-//! transaction *before* they begin hashing. If the pool operator lies or omits them, 
+//! Miners can query the HTTP Audit API (`/api/proof`) to receive a cryptographic
+//! proof that their exact accumulated score was included in the block's coinbase
+//! transaction *before* they begin hashing. If the pool operator lies or omits them,
 //! the miner's local client instantly detects the mismatch and disconnects.
 //!
 //! ## Security Mitigations Implemented
-//! 1. **Replay Protection (`valid_shares`)**: Prevents "Infinite Money" glitches where 
+//! 1. **Replay Protection (`valid_shares`)**: Prevents "Infinite Money" glitches where
 //!    a miner resubmits the same valid nonce millions of times per second.
-//! 2. **CPU Exhaustion Defense (`spawn_blocking`)**: Offloads the 1,000,000-iteration 
+//! 2. **CPU Exhaustion Defense (`spawn_blocking`)**: Offloads the 1,000,000-iteration
 //!    BLAKE3 VDF from the async reactor, preventing remote DoS attacks.
-//! 3. **Conditional Score Deduction**: Prevents "Orphan Theft" by waiting for the 
+//! 3. **Conditional Score Deduction**: Prevents "Orphan Theft" by waiting for the
 //!    network to explicitly `HTTP 200 OK` the block before wiping the miners' shares.
 //! 4. **Tandem Port Binding**: Binds the Stratum TCP port and Audit HTTP port simultaneously
 //!    to guarantee they never desync due to ghost processes holding TCP sockets open.
-//! 5. **Checksum-Agnostic Ingestion**: Strips 4-byte UI checksums from user-supplied 
+//! 5. **Checksum-Agnostic Ingestion**: Strips 4-byte UI checksums from user-supplied
 //!    addresses before hashing to prevent silent HTTP 400 rejection loops from the core node.
 
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -31,10 +37,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock, Semaphore};
-use axum::{extract::{State, Query}, http::StatusCode, routing::{get, post}, Json, Router};
 
-use crate::core::types::{hash, hash_concat, Batch, Extension};
 use crate::core::extension::create_extension;
+use crate::core::types::{hash, hash_concat, Batch, Extension};
 
 /// The database table storing the cumulative scores of all miners.
 /// Key: 32-byte cryptographic address hash. Value: u64 share count.
@@ -51,9 +56,7 @@ const BLOCKS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("blocks");
 /// historical split-verification (proving each payout was proportional to score).
 const BLOCK_SCORES_TABLE: TableDefinition<u64, &str> = TableDefinition::new("block_scores");
 const POOL_STATS_SCHEMA_VERSION: u64 = 2;
-const PPLNS_WINDOW_SECS: u64 = 60 * 60;
 const ACTIVE_WINDOW_SECS: u64 = 5 * 60;
-const PPLNS_BUCKET_SECS: u64 = 60;
 const SCORE_REFRESH_MIN_SECS: u64 = 60;
 
 fn unix_now_secs() -> u64 {
@@ -63,38 +66,20 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn pplns_bucket(ts: u64) -> u64 {
-    ts / PPLNS_BUCKET_SECS
-}
-
-fn pplns_key(bucket: u64, addr: &[u8; 32]) -> String {
-    format!("{:016x}:{}", bucket, hex::encode(addr))
-}
-
-fn parse_pplns_key(key: &str) -> Option<(u64, [u8; 32])> {
-    let (bucket_hex, addr_hex) = key.split_once(':')?;
-    let bucket = u64::from_str_radix(bucket_hex, 16).ok()?;
-    let mut addr = [0u8; 32];
-    hex::decode_to_slice(addr_hex, &mut addr).ok()?;
-    Some((bucket, addr))
-}
-
-fn load_pplns_scores(db: &Database, now: u64) -> Vec<([u8; 32], u64)> {
-    let cutoff_bucket = pplns_bucket(now.saturating_sub(PPLNS_WINDOW_SECS));
-    let mut scores: HashMap<[u8; 32], u64> = HashMap::new();
+fn load_current_scores(db: &Database) -> Vec<([u8; 32], u64)> {
+    let mut scores = Vec::new();
     if let Ok(read_txn) = db.begin_read() {
-        if let Ok(table) = read_txn.open_table(PPLNS_SHARES_TABLE) {
+        if let Ok(table) = read_txn.open_table(SHARES_TABLE) {
             for iter in table.iter().unwrap() {
-                let (key, score) = iter.unwrap();
-                if let Some((bucket, addr)) = parse_pplns_key(key.value()) {
-                    if bucket >= cutoff_bucket {
-                        *scores.entry(addr).or_insert(0) += score.value();
-                    }
+                let (addr, score) = iter.unwrap();
+                let score = score.value();
+                if score > 0 {
+                    scores.push((*addr.value(), score));
                 }
             }
         }
     }
-    scores.into_iter().filter(|(_, score)| *score > 0).collect()
+    scores
 }
 
 fn configured_share_target() -> anyhow::Result<[u8; 32]> {
@@ -118,6 +103,28 @@ fn configured_share_target() -> anyhow::Result<[u8; 32]> {
     target[..bytes.len()].copy_from_slice(&bytes);
     Ok(target)
 }
+
+fn share_difficulty_hashes(target: &[u8; 32]) -> u64 {
+    fn u256_to_f64(u: primitive_types::U256) -> f64 {
+        u.0[0] as f64
+            + (u.0[1] as f64) * 2.0f64.powi(64)
+            + (u.0[2] as f64) * 2.0f64.powi(128)
+            + (u.0[3] as f64) * 2.0f64.powi(192)
+    }
+
+    let target = primitive_types::U256::from_big_endian(target);
+    let hashes = 2.0f64.powi(256) / u256_to_f64(target).max(1.0);
+    hashes.round().max(1.0) as u64
+}
+
+fn set_difficulty_request(job: &Job) -> StratumRequest {
+    StratumRequest {
+        id: None,
+        method: "mining.set_difficulty".into(),
+        params: vec![serde_json::json!(share_difficulty_hashes(&job.share_target))],
+    }
+}
+
 // ── Stratum Protocol Types ──────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -158,16 +165,16 @@ struct Job {
 // ── Merkle Tree Logic for Share Proofs ──────────────────────────────────────
 
 /// A Merkle tree representing the current state of all miner shares in the pool.
-/// 
+///
 /// # Reasoning
-/// By constructing a Merkle tree of `H(Miner_Address || Score)`, we can compress 
-/// the entire state of the pool into a single 32-byte root. This root is embedded 
-/// into the salt of the pool's fee coin in the block template. This allows $O(\log N)$ 
+/// By constructing a Merkle tree of `H(Miner_Address || Score)`, we can compress
+/// the entire state of the pool into a single 32-byte root. This root is embedded
+/// into the salt of the pool's fee coin in the block template. This allows $O(\log N)$
 /// inclusion proofs for miners to audit their shares.
 #[derive(Clone)]
 pub struct ShareMerkleTree {
     pub root: [u8; 32],
-    pub leaves: Vec<([u8; 32], u64)>, 
+    pub leaves: Vec<([u8; 32], u64)>,
     pub layers: Vec<Vec<[u8; 32]>>,
 }
 
@@ -194,17 +201,24 @@ impl ShareMerkleTree {
     /// ```
     fn build(mut shares: Vec<([u8; 32], u64)>) -> Self {
         if shares.is_empty() {
-            return Self { root: [0; 32], leaves: vec![], layers: vec![] };
+            return Self {
+                root: [0; 32],
+                leaves: vec![],
+                layers: vec![],
+            };
         }
-        
+
         shares.sort_by_key(|&(addr, _)| addr);
-        
-        let mut current_layer: Vec<[u8; 32]> = shares.iter().map(|(addr, score)| {
-            let mut data = [0u8; 40];
-            data[0..32].copy_from_slice(addr);
-            data[32..40].copy_from_slice(&score.to_le_bytes());
-            hash(&data)
-        }).collect();
+
+        let mut current_layer: Vec<[u8; 32]> = shares
+            .iter()
+            .map(|(addr, score)| {
+                let mut data = [0u8; 40];
+                data[0..32].copy_from_slice(addr);
+                data[32..40].copy_from_slice(&score.to_le_bytes());
+                hash(&data)
+            })
+            .collect();
 
         let mut layers = vec![current_layer.clone()];
 
@@ -221,7 +235,11 @@ impl ShareMerkleTree {
             current_layer = next_layer;
         }
 
-        Self { root: current_layer[0], leaves: shares, layers }
+        Self {
+            root: current_layer[0],
+            leaves: shares,
+            layers,
+        }
     }
 
     /// Generates an $O(\log N)$ Merkle inclusion proof for a specific miner address.
@@ -233,7 +251,11 @@ impl ShareMerkleTree {
 
         for layer in &self.layers[..self.layers.len() - 1] {
             let is_right = current_idx % 2 == 1;
-            let sibling_idx = if is_right { current_idx - 1 } else { (current_idx + 1).min(layer.len() - 1) };
+            let sibling_idx = if is_right {
+                current_idx - 1
+            } else {
+                (current_idx + 1).min(layer.len() - 1)
+            };
             proof.push(layer[sibling_idx]);
             current_idx /= 2;
         }
@@ -243,7 +265,7 @@ impl ShareMerkleTree {
 
 // ── App State ───────────────────────────────────────────────────────────────
 
-/// Global state shared across the HTTP Audit API, the Core Polling Task, 
+/// Global state shared across the HTTP Audit API, the Core Polling Task,
 /// and the TCP Stratum Socket Handlers.
 struct PoolState {
     db: Arc<Database>,
@@ -255,7 +277,7 @@ struct PoolState {
     current_tree: RwLock<ShareMerkleTree>,
     /// The Share Replay Cache. Tracks successfully submitted (job, nonce) pairs.
     /// Wiped clean every time a new block is detected to prevent OOM.
-    valid_shares: RwLock<HashSet<(u64, u64)>>, 
+    valid_shares: RwLock<HashSet<(u64, u64)>>,
     /// Dynamic RPC URL of the core node, provided at startup.
     node_rpc_url: String,
     /// The percentage fee the pool takes from block rewards (e.g., 1.0 for 1%).
@@ -360,10 +382,18 @@ async fn get_http_work(
         let job = build_solo_job(state.clone(), miner_addr)
             .await
             .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
-        state.http_solo_jobs.write().await.insert(miner_addr, job.clone());
+        state
+            .http_solo_jobs
+            .write()
+            .await
+            .insert(miner_addr, job.clone());
         job
     } else {
-        state.current_job.read().await.clone()
+        state
+            .current_job
+            .read()
+            .await
+            .clone()
             .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no mining job".to_string()))?
     };
 
@@ -380,8 +410,17 @@ async fn get_http_longpoll(
     State(state): State<Arc<PoolState>>,
     Query(query): Query<HttpLongpollQuery>,
 ) -> Json<serde_json::Value> {
-    let current = state.current_job.read().await.as_ref().map(|job| job.height)
-        .unwrap_or_else(|| state.current_height.load(std::sync::atomic::Ordering::Relaxed));
+    let current = state
+        .current_job
+        .read()
+        .await
+        .as_ref()
+        .map(|job| job.height)
+        .unwrap_or_else(|| {
+            state
+                .current_height
+                .load(std::sync::atomic::Ordering::Relaxed)
+        });
     if current != query.height {
         return Json(serde_json::json!({ "height": current }));
     }
@@ -389,8 +428,17 @@ async fn get_http_longpoll(
     let mut jobs = state.job_notifier.subscribe();
     let height = match tokio::time::timeout(Duration::from_secs(30), jobs.recv()).await {
         Ok(Ok(job)) => job.height,
-        _ => state.current_job.read().await.as_ref().map(|job| job.height)
-            .unwrap_or_else(|| state.current_height.load(std::sync::atomic::Ordering::Relaxed)),
+        _ => state
+            .current_job
+            .read()
+            .await
+            .as_ref()
+            .map(|job| job.height)
+            .unwrap_or_else(|| {
+                state
+                    .current_height
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            }),
     };
     Json(serde_json::json!({ "height": height }))
 }
@@ -401,8 +449,12 @@ async fn post_http_share(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let miner_addr = match crate::core::types::parse_address_flexible(&request.miner_addr) {
         Ok(address) => address,
-        Err(_) => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "accepted": false, "error": "invalid address" }))),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "accepted": false, "error": "invalid address" })),
+            )
+        }
     };
     let solo_job = if state.solo_mode {
         state.http_solo_jobs.read().await.get(&miner_addr).cloned()
@@ -415,8 +467,12 @@ async fn post_http_share(
     } else {
         match state.current_job.read().await.as_ref() {
             Some(job) => job.job_id,
-            None => return (StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "accepted": false, "error": "no mining job" }))),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "accepted": false, "error": "no mining job" })),
+                )
+            }
         }
     };
 
@@ -429,15 +485,27 @@ async fn post_http_share(
         job_id,
         request.batch.extension.nonce,
         Some(request.batch.extension.final_hash),
-    ).await;
+    )
+    .await;
 
-    if response.result.as_ref().and_then(serde_json::Value::as_bool) == Some(true) {
-        (StatusCode::OK, Json(serde_json::json!({ "accepted": true })))
+    if response
+        .result
+        .as_ref()
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "accepted": true })),
+        )
     } else {
-        (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "accepted": false,
-            "error": response.error.unwrap_or_else(|| "share rejected".to_string()),
-        })))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "accepted": false,
+                "error": response.error.unwrap_or_else(|| "share rejected".to_string()),
+            })),
+        )
     }
 }
 
@@ -454,8 +522,8 @@ async fn post_http_heartbeat(
 ///
 /// # Reasoning
 /// Stratum clients independently poll this endpoint upon receiving a `mining.notify`
-/// event. They use the returned index, score, and sibling hashes to reconstruct the 
-/// Merkle root locally. If it doesn't match the `salt` of the fee coin in the template, 
+/// event. They use the returned index, score, and sibling hashes to reconstruct the
+/// Merkle root locally. If it doesn't match the `salt` of the fee coin in the template,
 /// the miner knows the pool is lying and disconnects.
 ///
 /// # Security
@@ -469,15 +537,20 @@ async fn get_proof(
         Ok(a) => a,
         Err(_) => return Json(serde_json::json!({ "error": "Invalid address" })),
     };
-    
+
     let tree = state.current_tree.read().await;
-    let score = tree.leaves.iter().find(|(a, _)| a == &addr).map(|(_, s)| *s).unwrap_or(0);
-    
+    let score = tree
+        .leaves
+        .iter()
+        .find(|(a, _)| a == &addr)
+        .map(|(_, s)| *s)
+        .unwrap_or(0);
+
     if let Some((idx, proof)) = tree.generate_proof(&addr) {
         Json(serde_json::json!({
             "root": hex::encode(tree.root),
             "score": score,
-            "index": idx, 
+            "index": idx,
             "proof": proof.iter().map(hex::encode).collect::<Vec<_>>()
         }))
     } else {
@@ -613,7 +686,7 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
             }
         }
     } else {
-        for (a, s) in load_pplns_scores(&state.db, unix_now_secs()) {
+        for (a, s) in load_current_scores(&state.db) {
             let (accepted, rejected) = share_snapshot.get(&a).copied().unwrap_or((0, 0));
             miners.push(serde_json::json!({
                 "address": crate::core::types::encode_address_with_checksum(&a),
@@ -675,19 +748,19 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
     if let Some(job) = current_job {
         // Helper to convert U256 target to a float for math
         fn u256_to_f64(u: primitive_types::U256) -> f64 {
-            u.0[0] as f64 +
-            (u.0[1] as f64) * 2.0f64.powi(64) +
-            (u.0[2] as f64) * 2.0f64.powi(128) +
-            (u.0[3] as f64) * 2.0f64.powi(192)
+            u.0[0] as f64
+                + (u.0[1] as f64) * 2.0f64.powi(64)
+                + (u.0[2] as f64) * 2.0f64.powi(128)
+                + (u.0[3] as f64) * 2.0f64.powi(192)
         }
 
         let net_target = primitive_types::U256::from_big_endian(&job.network_target);
         let share_target = primitive_types::U256::from_big_endian(&state.share_target);
-        
+
         let max_u256 = 2.0f64.powi(256);
         let net_diff_hashes = max_u256 / u256_to_f64(net_target).max(1.0);
         network_hashrate = net_diff_hashes / BLOCK_TIME_SECS as f64;
-        
+
         hashes_per_share = max_u256 / u256_to_f64(share_target).max(1.0);
     }
 
@@ -724,9 +797,9 @@ async fn get_pool_stats(State(state): State<Arc<PoolState>>) -> Json<serde_json:
 /// Boots the Provably Fair Stratum Server and its companion HTTP Audit API.
 ///
 /// # Architecture
-/// This server is designed to run independently from the core Midstate node. 
-/// In professional mining setups, the core node is heavily firewalled or hidden 
-/// behind a VPN (e.g., Tailscale), while the Stratum server is exposed to the 
+/// This server is designed to run independently from the core Midstate node.
+/// In professional mining setups, the core node is heavily firewalled or hidden
+/// behind a VPN (e.g., Tailscale), while the Stratum server is exposed to the
 /// public internet.
 ///
 /// # Arguments
@@ -749,12 +822,12 @@ pub async fn run_stratum_pool(
     tracing::info!("starting stratum pool server in {:?} mode", pool_mode);
     let share_verify_workers = share_verify_workers.max(1);
     tracing::info!("share verifier workers: {}", share_verify_workers);
-    
+
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let db = Arc::new(Database::create(&db_path)?);
-    
+
     let write_txn = db.begin_write().unwrap();
     {
         let mut shares = write_txn.open_table(SHARES_TABLE).unwrap();
@@ -788,13 +861,16 @@ pub async fn run_stratum_pool(
             shares.remove(&a).unwrap();
         }
         if purged > 0 {
-            tracing::info!("purged {} stale zero-score address(es) from the shares table", purged);
+            tracing::info!(
+                "purged {} stale zero-score address(es) from the shares table",
+                purged
+            );
         }
     }
     write_txn.commit().unwrap();
 
     let (job_notifier, _) = broadcast::channel(32);
-    
+
     // Global share difficulty. Lower prefix = harder shares = fewer submits.
     // Example: 000f original/easy, 0008 ~2x harder, 0004 ~4x, 0002 ~8x.
     let share_target = configured_share_target()?;
@@ -802,6 +878,7 @@ pub async fn run_stratum_pool(
         "pool share target prefix: {}",
         hex::encode(&share_target[..4])
     );
+
     // Strip the UI checksum from the pool address so the backend node accepts it
     // during block template generation.
     let clean_pool_address_bytes = crate::core::types::parse_address_flexible(&pool_address)
@@ -828,10 +905,11 @@ pub async fn run_stratum_pool(
         force_new_job: std::sync::atomic::AtomicBool::new(false),
         last_score_refresh: std::sync::atomic::AtomicU64::new(0),
         solo_job_counter: std::sync::atomic::AtomicU64::new(
-            (1u64 << 63) | std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
+            (1u64 << 63)
+                | std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
         ),
         solo_mode: pool_mode == PoolMode::Solo,
         http_solo_jobs: RwLock::new(HashMap::new()),
@@ -843,7 +921,7 @@ pub async fn run_stratum_pool(
 
     // ── Tandem Port Binding ──
     // Bind both the Stratum Port and the Audit API port simultaneously.
-    // If either fails (e.g., stuck in TIME_WAIT), bump the offset and try the next pair. 
+    // If either fails (e.g., stuck in TIME_WAIT), bump the offset and try the next pair.
     // This guarantees the miner's offset math always aligns perfectly with the server.
     let (api_listener, stratum_listener) = loop {
         let a_res = tokio::net::TcpListener::bind(&api_bind_addr).await;
@@ -867,20 +945,20 @@ pub async fn run_stratum_pool(
 
     tokio::spawn(async move {
         let app = Router::new()
-            .route("/pool", get(pool_ui))            
-            .route("/midstate.css", get(pool_css))   
+            .route("/pool", get(pool_ui))
+            .route("/midstate.css", get(pool_css))
             .route("/pool/stats", get(get_pool_stats))
             .route("/pool/work", get(get_http_work))
             .route("/pool/longpoll", get(get_http_longpoll))
             .route("/pool/share", post(post_http_share))
             .route("/pool/submit", post(post_http_share))
             .route("/pool/heartbeat", post(post_http_heartbeat))
-            .route("/api/proof", get(get_proof))     
+            .route("/api/proof", get(get_proof))
             .route("/api/block_scores", get(get_block_scores))
             .with_state(api_state);
         axum::serve(api_listener, app).await.unwrap();
     });
-    
+
     // ── Core Polling & Template Builder Task ──
     let state_clone = state.clone();
     tokio::spawn(async move {
@@ -900,11 +978,15 @@ pub async fn run_stratum_pool(
 
         loop {
             let rpc_url = state_clone.node_rpc_url.clone();
-            
-            let net_state: serde_json::Value = match client.get(&format!("{}/state", rpc_url)).send().await {
-                Ok(res) => res.json().await.unwrap_or_default(),
-                Err(_) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
-            };
+
+            let net_state: serde_json::Value =
+                match client.get(&format!("{}/state", rpc_url)).send().await {
+                    Ok(res) => res.json().await.unwrap_or_default(),
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                };
 
             // ── Sync Guard ──
             // While the backend node is bulk-downloading historical blocks, every tip
@@ -916,7 +998,9 @@ pub async fn run_stratum_pool(
             // whose /state payload doesn't include the field.)
             if net_state["is_syncing"].as_bool().unwrap_or(false) {
                 if state_clone.current_job.write().await.take().is_some() {
-                    tracing::warn!("backend node is syncing historical blocks; pausing job generation");
+                    tracing::warn!(
+                        "backend node is syncing historical blocks; pausing job generation"
+                    );
                 }
                 last_network_tip.clear();
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -933,14 +1017,18 @@ pub async fn run_stratum_pool(
             // produces is the next one (tip + 1). Refreshed every poll so the dashboard
             // can show the live chain height even between our own block finds.
             let tip_height = net_state["height"].as_u64().unwrap_or(0);
-            state_clone.current_height.store(tip_height, std::sync::atomic::Ordering::Relaxed);
+            state_clone
+                .current_height
+                .store(tip_height, std::sync::atomic::Ordering::Relaxed);
             state_clone.current_block_reward.store(
                 net_state["block_reward"].as_u64().unwrap_or(0),
                 std::sync::atomic::Ordering::Relaxed,
             );
 
             let force_new_job = !current_tip.is_empty()
-                && state_clone.force_new_job.swap(false, std::sync::atomic::Ordering::SeqCst);
+                && state_clone
+                    .force_new_job
+                    .swap(false, std::sync::atomic::Ordering::SeqCst);
 
             if state_clone.solo_mode {
                 if let Some(t_hex) = net_state["target"].as_str() {
@@ -956,7 +1044,9 @@ pub async fn run_stratum_pool(
                             committed_scores: Arc::new(Vec::new()),
                         };
                         *state_clone.current_job.write().await = Some(job.clone());
-                        if (current_tip != last_network_tip || force_new_job) && !current_tip.is_empty() {
+                        if (current_tip != last_network_tip || force_new_job)
+                            && !current_tip.is_empty()
+                        {
                             last_network_tip = current_tip.clone();
                             state_clone.valid_shares.write().await.clear();
                             let _ = state_clone.job_notifier.send(job);
@@ -991,58 +1081,73 @@ pub async fn run_stratum_pool(
                 // distribution. Filtering here also keeps zero-score leaves out of the
                 // Merkle tree and the committed-score snapshot, so the precommitment only
                 // ever commits to addresses that actually worked the round.
-                let shares_vec = load_pplns_scores(&state_clone.db, unix_now_secs());
+                let shares_vec = load_current_scores(&state_clone.db);
                 let total_score: u128 = shares_vec.iter().map(|(_, score)| *score as u128).sum();
 
                 let tree = ShareMerkleTree::build(shares_vec.clone());
                 *state_clone.current_tree.write().await = tree.clone();
 
                 let mut expected_total = net_state["block_reward"].as_u64().unwrap_or(0);
-                state_clone.current_block_reward.store(expected_total, std::sync::atomic::Ordering::Relaxed);
-                
+                state_clone
+                    .current_block_reward
+                    .store(expected_total, std::sync::atomic::Ordering::Relaxed);
+
                 // ── Proportional Reward Distribution Algorithm ──
-                // Calculates the pool fee, then distributes the remaining reward 
+                // Calculates the pool fee, then distributes the remaining reward
                 // across all miners strictly proportional to their accumulated scores.
-                // Output values MUST be powers of 2. It iteratively assigns the largest 
+                // Output values MUST be powers of 2. It iteratively assigns the largest
                 // possible power-of-2 denomination to the miner with the highest current score.
                 let template_data = loop {
                     let mut coinbase_json = Vec::new();
-                    
-                    let pool_fee = (expected_total as f64 * (state_clone.pool_fee_percent / 100.0)) as u64;
-                    let safe_pool_fee = pool_fee.max(1); 
+
+                    let pool_fee =
+                        (expected_total as f64 * (state_clone.pool_fee_percent / 100.0)) as u64;
+                    let safe_pool_fee = pool_fee.max(1);
                     let actual_distributable = expected_total.saturating_sub(safe_pool_fee);
-                    
+
                     let fee_coins = crate::core::types::decompose_value(safe_pool_fee);
                     for (i, coin) in fee_coins.into_iter().enumerate() {
                         // Embed the Merkle Precommitment in the FIRST fee coin's salt.
-                        let salt = if i == 0 { 
-                            hex::encode(tree.root) 
-                        } else { 
-                            hex::encode(rand::random::<[u8; 32]>()) 
+                        let salt = if i == 0 {
+                            hex::encode(tree.root)
+                        } else {
+                            hex::encode(rand::random::<[u8; 32]>())
                         };
-                        
+
                         coinbase_json.push(serde_json::json!({
                             "address": state_clone.pool_address,
                             "value": coin,
-                            "salt": salt 
+                            "salt": salt
                         }));
                     }
 
                     if actual_distributable > 0 {
                         if total_score > 0 {
-                            let mut scores: HashMap<_, i64> = shares_vec.clone().into_iter().map(|(k,v)| (k, v as i64)).collect();
-                            for coin in crate::core::types::decompose_value(actual_distributable).into_iter().rev() {
+                            let mut scores: HashMap<_, i64> = shares_vec
+                                .clone()
+                                .into_iter()
+                                .map(|(k, v)| (k, v as i64))
+                                .collect();
+                            for coin in crate::core::types::decompose_value(actual_distributable)
+                                .into_iter()
+                                .rev()
+                            {
                                 let mut best_miner = [0u8; 32];
                                 let mut max_score = i64::MIN;
                                 for (addr, &score) in &scores {
-                                    if score > max_score { max_score = score; best_miner = *addr; }
+                                    if score > max_score {
+                                        max_score = score;
+                                        best_miner = *addr;
+                                    }
                                 }
                                 coinbase_json.push(serde_json::json!({
                                     "address": hex::encode(best_miner),
                                     "value": coin,
                                     "salt": hex::encode(rand::random::<[u8; 32]>())
                                 }));
-                                let simulated_drop = ((coin as u128 * total_score) / (actual_distributable as u128)) as i64;
+                                let simulated_drop = ((coin as u128 * total_score)
+                                    / (actual_distributable as u128))
+                                    as i64;
                                 *scores.get_mut(&best_miner).unwrap() -= simulated_drop.max(1);
                             }
                         } else {
@@ -1057,7 +1162,12 @@ pub async fn run_stratum_pool(
                     }
 
                     let req = serde_json::json!({ "coinbase": coinbase_json });
-                    if let Ok(res) = client.post(&format!("{}/block_template", rpc_url)).json(&req).send().await {
+                    if let Ok(res) = client
+                        .post(&format!("{}/block_template", rpc_url))
+                        .json(&req)
+                        .send()
+                        .await
+                    {
                         if let Ok(json) = res.json::<serde_json::Value>().await {
                             if let Some(err) = json.get("error") {
                                 let err_str = err.as_str().unwrap_or("");
@@ -1067,11 +1177,14 @@ pub async fn run_stratum_pool(
                                         if let Ok(new_expected) = num_str.parse::<u64>() {
                                             tracing::info!("Mempool fees detected. Adjusting block value to {}", new_expected);
                                             expected_total = new_expected;
-                                            continue; 
+                                            continue;
                                         }
                                     }
                                 }
-                                tracing::error!("Node rejected block template request: {}", err_str);
+                                tracing::error!(
+                                    "Node rejected block template request: {}",
+                                    err_str
+                                );
                                 break None;
                             }
                             break Some(json);
@@ -1087,10 +1200,14 @@ pub async fn run_stratum_pool(
                         let mut template_target = [0u8; 32];
                         let target_is_valid = template["target"]
                             .as_str()
-                            .map(|target| hex::decode_to_slice(target, &mut template_target).is_ok())
+                            .map(|target| {
+                                hex::decode_to_slice(target, &mut template_target).is_ok()
+                            })
                             .unwrap_or(false);
                         if !target_is_valid {
-                            tracing::error!("Node returned a block template without a valid target");
+                            tracing::error!(
+                                "Node returned a block template without a valid target"
+                            );
                             last_network_tip.clear();
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
@@ -1114,7 +1231,11 @@ pub async fn run_stratum_pool(
                             .last_score_refresh
                             .store(unix_now_secs(), std::sync::atomic::Ordering::SeqCst);
                         let _ = state_clone.job_notifier.send(job);
-                        tracing::info!("new job {}: root {}", job_counter, hex::encode(&tree.root[..8]));
+                        tracing::info!(
+                            "new job {}: root {}",
+                            job_counter,
+                            hex::encode(&tree.root[..8])
+                        );
                     }
                 } else {
                     last_network_tip.clear();
@@ -1152,8 +1273,11 @@ async fn build_solo_job(state: Arc<PoolState>, miner_addr: [u8; 32]) -> anyhow::
 
     let tip_height = net_state["height"].as_u64().unwrap_or(0);
     let mut network_target = [0u8; 32];
-    hex::decode_to_slice(net_state["target"].as_str().unwrap_or(""), &mut network_target)
-        .map_err(|e| anyhow::anyhow!("invalid node target: {}", e))?;
+    hex::decode_to_slice(
+        net_state["target"].as_str().unwrap_or(""),
+        &mut network_target,
+    )
+    .map_err(|e| anyhow::anyhow!("invalid node target: {}", e))?;
 
     let mut expected_total = net_state["block_reward"].as_u64().unwrap_or(0);
     let template_data = loop {
@@ -1193,7 +1317,10 @@ async fn build_solo_job(state: Arc<PoolState>, miner_addr: [u8; 32]) -> anyhow::
             if err_str.contains("Expected: ") {
                 if let Some(num_str) = err_str.split("Expected: ").nth(1) {
                     if let Ok(new_expected) = num_str.parse::<u64>() {
-                        tracing::info!("Mempool fees detected. Adjusting solo block value to {}", new_expected);
+                        tracing::info!(
+                            "Mempool fees detected. Adjusting solo block value to {}",
+                            new_expected
+                        );
                         expected_total = new_expected;
                         continue;
                     }
@@ -1206,14 +1333,23 @@ async fn build_solo_job(state: Arc<PoolState>, miner_addr: [u8; 32]) -> anyhow::
     };
 
     let mut mining_hash = [0u8; 32];
-    hex::decode_to_slice(template_data["mining_midstate"].as_str().unwrap_or(""), &mut mining_hash)
-        .map_err(|e| anyhow::anyhow!("invalid solo mining midstate: {}", e))?;
+    hex::decode_to_slice(
+        template_data["mining_midstate"].as_str().unwrap_or(""),
+        &mut mining_hash,
+    )
+    .map_err(|e| anyhow::anyhow!("invalid solo mining midstate: {}", e))?;
 
     let mut template_target = [0u8; 32];
-    hex::decode_to_slice(template_data["target"].as_str().unwrap_or(""), &mut template_target)
-        .map_err(|e| anyhow::anyhow!("invalid solo template target: {}", e))?;
+    hex::decode_to_slice(
+        template_data["target"].as_str().unwrap_or(""),
+        &mut template_target,
+    )
+    .map_err(|e| anyhow::anyhow!("invalid solo template target: {}", e))?;
 
-    let job_id = state.solo_job_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let job_id = state
+        .solo_job_counter
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
     Ok(Job {
         job_id,
         mining_hash,
@@ -1239,7 +1375,13 @@ async fn validate_share_submit(
     let _permit = match state.share_verify_sem.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+            state
+                .share_stats
+                .write()
+                .await
+                .entry(miner_addr)
+                .or_insert((0, 0))
+                .1 += 1;
             return StratumResponse {
                 id: req_id,
                 result: Some(serde_json::json!(false)),
@@ -1253,7 +1395,13 @@ async fn validate_share_submit(
         if job.job_id == job_id {
             job
         } else {
-            state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+            state
+                .share_stats
+                .write()
+                .await
+                .entry(miner_addr)
+                .or_insert((0, 0))
+                .1 += 1;
             return StratumResponse {
                 id: req_id,
                 result: Some(serde_json::json!(false)),
@@ -1264,7 +1412,13 @@ async fn validate_share_submit(
         match state.current_job.read().await.clone() {
             Some(job) if job.job_id == job_id => job,
             _ => {
-                state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+                state
+                    .share_stats
+                    .write()
+                    .await
+                    .entry(miner_addr)
+                    .or_insert((0, 0))
+                    .1 += 1;
                 return StratumResponse {
                     id: req_id,
                     result: Some(serde_json::json!(false)),
@@ -1278,7 +1432,13 @@ async fn validate_share_submit(
         let mut cache = state.valid_shares.write().await;
         if !cache.insert((job.job_id, nonce)) {
             drop(cache);
-            state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+            state
+                .share_stats
+                .write()
+                .await
+                .entry(miner_addr)
+                .or_insert((0, 0))
+                .1 += 1;
             return StratumResponse {
                 id: req_id,
                 result: Some(serde_json::json!(false)),
@@ -1295,7 +1455,13 @@ async fn validate_share_submit(
                 Ok(ext) => ext,
                 Err(e) => {
                     tracing::warn!("share verification task failed: {}", e);
-                    state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+                    state
+                        .share_stats
+                        .write()
+                        .await
+                        .entry(miner_addr)
+                        .or_insert((0, 0))
+                        .1 += 1;
                     return StratumResponse {
                         id: req_id,
                         result: Some(serde_json::json!(false)),
@@ -1312,18 +1478,25 @@ async fn validate_share_submit(
     // turns a generic node-side rejection into a definitive miner/template check.
     if submitted_hash.is_some() && ext.final_hash < job.network_target {
         let mining_hash = job.mining_hash;
-        let expected = match tokio::task::spawn_blocking(move || create_extension(mining_hash, nonce)).await {
-            Ok(expected) => expected,
-            Err(e) => {
-                tracing::warn!("block candidate verification task failed: {}", e);
-                state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
-                return StratumResponse {
-                    id: req_id,
-                    result: Some(serde_json::json!(false)),
-                    error: Some("Block candidate verification failed".into()),
-                };
-            }
-        };
+        let expected =
+            match tokio::task::spawn_blocking(move || create_extension(mining_hash, nonce)).await {
+                Ok(expected) => expected,
+                Err(e) => {
+                    tracing::warn!("block candidate verification task failed: {}", e);
+                    state
+                        .share_stats
+                        .write()
+                        .await
+                        .entry(miner_addr)
+                        .or_insert((0, 0))
+                        .1 += 1;
+                    return StratumResponse {
+                        id: req_id,
+                        result: Some(serde_json::json!(false)),
+                        error: Some("Block candidate verification failed".into()),
+                    };
+                }
+            };
 
         if expected.final_hash != ext.final_hash {
             tracing::warn!(
@@ -1333,7 +1506,13 @@ async fn validate_share_submit(
                 hex::encode(ext.final_hash),
                 hex::encode(expected.final_hash),
             );
-            state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+            state
+                .share_stats
+                .write()
+                .await
+                .entry(miner_addr)
+                .or_insert((0, 0))
+                .1 += 1;
             return StratumResponse {
                 id: req_id,
                 result: Some(serde_json::json!(false)),
@@ -1343,7 +1522,13 @@ async fn validate_share_submit(
     }
 
     if ext.final_hash >= job.share_target {
-        state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+        state
+            .share_stats
+            .write()
+            .await
+            .entry(miner_addr)
+            .or_insert((0, 0))
+            .1 += 1;
         return StratumResponse {
             id: req_id,
             result: Some(serde_json::json!(false)),
@@ -1354,14 +1539,17 @@ async fn validate_share_submit(
     if !is_solo {
         let _db_guard = state.db_write_lock.lock().await;
         let now = unix_now_secs();
-        let bucket = pplns_bucket(now);
-        let key = pplns_key(bucket, &miner_addr);
-        let stale_cutoff = pplns_bucket(now.saturating_sub(PPLNS_WINDOW_SECS + PPLNS_BUCKET_SECS));
         let write_txn = match state.db.begin_write() {
             Ok(txn) => txn,
             Err(e) => {
                 tracing::warn!("share score db begin_write failed: {}", e);
-                state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+                state
+                    .share_stats
+                    .write()
+                    .await
+                    .entry(miner_addr)
+                    .or_insert((0, 0))
+                    .1 += 1;
                 return StratumResponse {
                     id: req_id,
                     result: Some(serde_json::json!(false)),
@@ -1370,11 +1558,17 @@ async fn validate_share_submit(
             }
         };
         {
-            let mut table = match write_txn.open_table(PPLNS_SHARES_TABLE) {
+            let mut table = match write_txn.open_table(SHARES_TABLE) {
                 Ok(table) => table,
                 Err(e) => {
                     tracing::warn!("share score db table open failed: {}", e);
-                    state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+                    state
+                        .share_stats
+                        .write()
+                        .await
+                        .entry(miner_addr)
+                        .or_insert((0, 0))
+                        .1 += 1;
                     return StratumResponse {
                         id: req_id,
                         result: Some(serde_json::json!(false)),
@@ -1382,11 +1576,17 @@ async fn validate_share_submit(
                     };
                 }
             };
-            let current = match table.get(key.as_str()) {
+            let current = match table.get(&miner_addr) {
                 Ok(value) => value.map(|v| v.value()).unwrap_or(0),
                 Err(e) => {
                     tracing::warn!("share score db read failed: {}", e);
-                    state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+                    state
+                        .share_stats
+                        .write()
+                        .await
+                        .entry(miner_addr)
+                        .or_insert((0, 0))
+                        .1 += 1;
                     return StratumResponse {
                         id: req_id,
                         result: Some(serde_json::json!(false)),
@@ -1394,9 +1594,15 @@ async fn validate_share_submit(
                     };
                 }
             };
-            if let Err(e) = table.insert(key.as_str(), current + 1) {
+            if let Err(e) = table.insert(&miner_addr, current + 1) {
                 tracing::warn!("share score db write failed: {}", e);
-                state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+                state
+                    .share_stats
+                    .write()
+                    .await
+                    .entry(miner_addr)
+                    .or_insert((0, 0))
+                    .1 += 1;
                 return StratumResponse {
                     id: req_id,
                     result: Some(serde_json::json!(false)),
@@ -1404,30 +1610,25 @@ async fn validate_share_submit(
                 };
             };
 
-            let stale: Vec<String> = table
-                .iter()
-                .unwrap()
-                .filter_map(|iter| {
-                    let (key, _) = iter.unwrap();
-                    let key = key.value();
-                    let (bucket, _) = parse_pplns_key(key)?;
-                    (bucket < stale_cutoff).then(|| key.to_string())
-                })
-                .collect();
-            for key in stale {
-                table.remove(key.as_str()).unwrap();
-            }
         }
         if let Err(e) = write_txn.commit() {
             tracing::warn!("share score db commit failed: {}", e);
-            state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).1 += 1;
+            state
+                .share_stats
+                .write()
+                .await
+                .entry(miner_addr)
+                .or_insert((0, 0))
+                .1 += 1;
             return StratumResponse {
                 id: req_id,
                 result: Some(serde_json::json!(false)),
                 error: Some("DB commit error".into()),
             };
         }
-        let last_refresh = state.last_score_refresh.load(std::sync::atomic::Ordering::Relaxed);
+        let last_refresh = state
+            .last_score_refresh
+            .load(std::sync::atomic::Ordering::Relaxed);
         if now.saturating_sub(last_refresh) >= SCORE_REFRESH_MIN_SECS
             && state
                 .last_score_refresh
@@ -1439,12 +1640,25 @@ async fn validate_share_submit(
                 )
                 .is_ok()
         {
-            state.force_new_job.store(true, std::sync::atomic::Ordering::SeqCst);
+            state
+                .force_new_job
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
-    state.share_stats.write().await.entry(miner_addr).or_insert((0, 0)).0 += 1;
-    *state.worker_stats.write().await.entry((miner_addr, authorized_worker.clone())).or_insert(0) += 1;
+    state
+        .share_stats
+        .write()
+        .await
+        .entry(miner_addr)
+        .or_insert((0, 0))
+        .0 += 1;
+    *state
+        .worker_stats
+        .write()
+        .await
+        .entry((miner_addr, authorized_worker.clone()))
+        .or_insert(0) += 1;
     state.worker_last_share.write().await.insert(
         (miner_addr, authorized_worker.clone()),
         std::time::SystemTime::now()
@@ -1454,7 +1668,10 @@ async fn validate_share_submit(
     );
 
     if ext.final_hash < job.network_target {
-        tracing::info!("block found by miner {}. submitting to network.", hex::encode(&miner_addr[..8]));
+        tracing::info!(
+            "block found by miner {}. submitting to network.",
+            hex::encode(&miner_addr[..8])
+        );
         let block_hash_hex = hex::encode(ext.final_hash);
         let block_net_target_hex = hex::encode(job.network_target);
         let block_height = job.height;
@@ -1463,10 +1680,15 @@ async fn validate_share_submit(
             Ok(batch) => batch,
             Err(e) => {
                 tracing::warn!("failed to decode block template for found block: {}", e);
-                return StratumResponse { id: req_id, result: Some(serde_json::json!(true)), error: None };
+                return StratumResponse {
+                    id: req_id,
+                    result: Some(serde_json::json!(true)),
+                    error: None,
+                };
             }
         };
         batch.extension = ext;
+        let total_reward: u64 = batch.coinbase.iter().map(|cb| cb.value).sum();
         let batch_for_node = batch.clone();
         let rpc_url = state.node_rpc_url.clone();
         let submit_state = state.clone();
@@ -1474,20 +1696,27 @@ async fn validate_share_submit(
         let submitting_miner = miner_addr;
 
         tokio::spawn(async move {
-            let res = reqwest::Client::new().post(&format!("{}/submit_batch", rpc_url))
-                .json(&batch_for_node).send().await;
+            let res = reqwest::Client::new()
+                .post(&format!("{}/submit_batch", rpc_url))
+                .json(&batch_for_node)
+                .send()
+                .await;
 
             match res {
                 Ok(resp) if resp.status().is_success() => {
                     if solo_submission {
-                        tracing::info!("solo block accepted by network. retaining shared pool scores.");
+                        tracing::info!(
+                            "solo block accepted by network. retaining shared pool scores."
+                        );
                     } else {
-                        tracing::info!("block accepted by network. retaining rolling 1h PPLNS scores.");
+                        tracing::info!(
+                            "block accepted by network. applying current-round score deductions."
+                        );
                     }
                     let _db_guard = submit_state.db_write_lock.lock().await;
                     let write_txn = submit_state.db.begin_write().unwrap();
                     {
-                        let mut table = write_txn.open_table(PPLNS_SHARES_TABLE).unwrap();
+                        let mut table = write_txn.open_table(SHARES_TABLE).unwrap();
                         let total_score: u128 = if solo_submission {
                             let workers = submit_state.worker_stats.read().await;
                             workers
@@ -1496,33 +1725,33 @@ async fn validate_share_submit(
                                 .map(|(_, score)| *score as u128)
                                 .sum()
                         } else {
-                            committed_scores.iter().map(|(_, score)| *score as u128).sum()
+                            committed_scores
+                                .iter()
+                                .map(|(_, score)| *score as u128)
+                                .sum()
                         };
 
                         let mut payouts = Vec::new();
                         for cb in &batch.coinbase {
-                            let mut a = [0u8; 32]; a.copy_from_slice(&cb.address);
+                            let mut a = [0u8; 32];
+                            a.copy_from_slice(&cb.address);
+                            if !solo_submission {
+                                let deduction =
+                                    ((cb.value as u128 * total_score) / (total_reward as u128))
+                                        as u64;
+                                if let Some(current) = table.get(&a).unwrap().map(|v| v.value()) {
+                                    let remaining = current.saturating_sub(deduction);
+                                    if remaining > 0 {
+                                        table.insert(&a, remaining).unwrap();
+                                    } else {
+                                        table.remove(&a).unwrap();
+                                    }
+                                }
+                            }
                             payouts.push(serde_json::json!({
                                 "address": crate::core::types::encode_address_with_checksum(&a),
                                 "value": cb.value
                             }));
-                        }
-
-                        if !solo_submission {
-                            let stale_cutoff = pplns_bucket(unix_now_secs().saturating_sub(PPLNS_WINDOW_SECS + PPLNS_BUCKET_SECS));
-                            let stale: Vec<String> = table
-                                .iter()
-                                .unwrap()
-                                .filter_map(|iter| {
-                                    let (key, _) = iter.unwrap();
-                                    let key = key.value();
-                                    let (bucket, _) = parse_pplns_key(key)?;
-                                    (bucket < stale_cutoff).then(|| key.to_string())
-                                })
-                                .collect();
-                            for key in stale {
-                                table.remove(key.as_str()).unwrap();
-                            }
                         }
 
                         let mut b_table = write_txn.open_table(BLOCKS_TABLE).unwrap();
@@ -1536,19 +1765,30 @@ async fn validate_share_submit(
                             "net_target": block_net_target_hex,
                             "payouts": payouts
                         }).to_string();
-                        b_table.insert(batch.timestamp, block_data.as_str()).unwrap();
+                        b_table
+                            .insert(batch.timestamp, block_data.as_str())
+                            .unwrap();
 
-                        let committed_total: u128 = committed_scores.iter().map(|(_, s)| *s as u128).sum();
-                        let scores_json: Vec<serde_json::Value> = committed_scores.iter().map(|(a, s)| serde_json::json!({
-                            "address": crate::core::types::encode_address_with_checksum(a),
-                            "score": s
-                        })).collect();
+                        let committed_total: u128 =
+                            committed_scores.iter().map(|(_, s)| *s as u128).sum();
+                        let scores_json: Vec<serde_json::Value> = committed_scores
+                            .iter()
+                            .map(|(a, s)| {
+                                serde_json::json!({
+                                    "address": crate::core::types::encode_address_with_checksum(a),
+                                    "score": s
+                                })
+                            })
+                            .collect();
                         let scores_data = serde_json::json!({
                             "total_score": committed_total as u64,
                             "scores": scores_json
-                        }).to_string();
+                        })
+                        .to_string();
                         let mut s_table = write_txn.open_table(BLOCK_SCORES_TABLE).unwrap();
-                        s_table.insert(batch.timestamp, scores_data.as_str()).unwrap();
+                        s_table
+                            .insert(batch.timestamp, scores_data.as_str())
+                            .unwrap();
                     }
                     write_txn.commit().unwrap();
                     if solo_submission {
@@ -1563,7 +1803,9 @@ async fn validate_share_submit(
                             .await
                             .retain(|(addr, _), _| *addr != submitting_miner);
                     } else {
-                        submit_state.last_score_refresh.store(0, std::sync::atomic::Ordering::SeqCst);
+                        submit_state
+                            .last_score_refresh
+                            .store(0, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
                 Ok(resp) => {
@@ -1573,20 +1815,28 @@ async fn validate_share_submit(
                         "block rejected by network ({}): {}. retaining miner scores; requesting fresh job.",
                         status, body.trim()
                     );
-                    submit_state.force_new_job.store(true, std::sync::atomic::Ordering::SeqCst);
+                    submit_state
+                        .force_new_job
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 Err(e) => {
                     tracing::error!(
                         "block submission to node failed: {}. retaining miner scores; requesting fresh job.",
                         e
                     );
-                    submit_state.force_new_job.store(true, std::sync::atomic::Ordering::SeqCst);
+                    submit_state
+                        .force_new_job
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         });
     }
 
-    StratumResponse { id: req_id, result: Some(serde_json::json!(true)), error: None }
+    StratumResponse {
+        id: req_id,
+        result: Some(serde_json::json!(true)),
+        error: None,
+    }
 }
 
 /// Handles an active TCP Stratum session with a miner.
@@ -1652,6 +1902,8 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                     Ok(job) => {
                                         tracing::info!("solo miner authorized: {}", hex::encode(&addr_bytes[..8]));
                                         solo_job = Some(job.clone());
+                                        let diff = set_difficulty_request(&job);
+                                        write_half.write_all(format!("{}\n", serde_json::to_string(&diff)?).as_bytes()).await?;
                                         let notif = StratumRequest {
                                             id: None,
                                             method: "mining.notify".into(),
@@ -1674,9 +1926,11 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                     params: vec![
                                         serde_json::json!(job.job_id),
                                         serde_json::json!(hex::encode(job.mining_hash)),
-                                        serde_json::json!(job.batch_template) 
+                                        serde_json::json!(job.batch_template)
                                     ]
                                 };
+                                let diff = set_difficulty_request(&job);
+                                write_half.write_all(format!("{}\n", serde_json::to_string(&diff)?).as_bytes()).await?;
                                 write_half.write_all(format!("{}\n", serde_json::to_string(&notif)?).as_bytes()).await?;
                             }
                         } else {
@@ -1770,7 +2024,7 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                             let committed_scores = job.committed_scores.clone();
                                             let mut batch: Batch = serde_json::from_value(job.batch_template).unwrap();
                                             batch.extension = ext;
-                                            
+
                                             let total_reward: u64 = batch.coinbase.iter().map(|cb| cb.value).sum();
                                             let batch_for_node = batch.clone();
                                             let db_clone = state.db.clone();
@@ -1778,11 +2032,11 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                             // Cloned into the submission task so it can flag the template
                                             // loop for a fresh job on rejection/failure (force_new_job).
                                             let submit_state = state.clone();
-                                            
+
                                             tokio::spawn(async move {
                                                 let res = reqwest::Client::new().post(&format!("{}/submit_batch", rpc_url))
                                                     .json(&batch_for_node).send().await;
-                                                    
+
                                                 match res {
                                                     Ok(resp) if resp.status().is_success() => {
                                                         tracing::info!("block accepted by network. applying score deductions.");
@@ -1791,8 +2045,8 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                                             let mut table = write_txn.open_table(SHARES_TABLE).unwrap();
                                                             let mut total_score = 0u128;
                                                             for iter in table.iter().unwrap() { total_score += iter.unwrap().1.value() as u128; }
-                                                            
-                                                            let mut payouts = Vec::new(); 
+
+                                                            let mut payouts = Vec::new();
 
                                                             for cb in &batch.coinbase {
                                                                 let mut a = [0u8; 32]; a.copy_from_slice(&cb.address);
@@ -1811,7 +2065,7 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                                                                         table.remove(&a).unwrap();
                                                                     }
                                                                 }
-                                                                
+
                                                                 // <--- Record payout for dashboard
                                                                 payouts.push(serde_json::json!({
                                                                     "address": crate::core::types::encode_address_with_checksum(&a),
@@ -1912,6 +2166,8 @@ async fn handle_miner(mut socket: TcpStream, state: Arc<PoolState>) -> anyhow::R
                 };
 
                 if let Some(job) = notify_job {
+                    let diff = set_difficulty_request(&job);
+                    write_half.write_all(format!("{}\n", serde_json::to_string(&diff)?).as_bytes()).await?;
                     let notif = StratumRequest {
                         id: None,
                         method: "mining.notify".into(),
