@@ -97,6 +97,27 @@ fn load_pplns_scores(db: &Database, now: u64) -> Vec<([u8; 32], u64)> {
     scores.into_iter().filter(|(_, score)| *score > 0).collect()
 }
 
+fn configured_share_target() -> anyhow::Result<[u8; 32]> {
+    let prefix = std::env::var("MIDSTATE_POOL_SHARE_TARGET_PREFIX")
+        .unwrap_or_else(|_| "0004".to_string());
+    let clean = prefix
+        .strip_prefix("0x")
+        .unwrap_or(prefix.as_str())
+        .trim()
+        .to_ascii_lowercase();
+
+    if clean.is_empty() || clean.len() > 64 || clean.len() % 2 != 0 {
+        anyhow::bail!(
+            "MIDSTATE_POOL_SHARE_TARGET_PREFIX must be even-length hex, 1 to 32 bytes"
+        );
+    }
+
+    let bytes = hex::decode(&clean)
+        .map_err(|e| anyhow::anyhow!("invalid MIDSTATE_POOL_SHARE_TARGET_PREFIX hex: {}", e))?;
+    let mut target = [0xff; 32];
+    target[..bytes.len()].copy_from_slice(&bytes);
+    Ok(target)
+}
 // ── Stratum Protocol Types ──────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -774,9 +795,13 @@ pub async fn run_stratum_pool(
 
     let (job_notifier, _) = broadcast::channel(32);
     
-    let mut share_target = [0xff; 32];
-    share_target[0] = 0x00; share_target[1] = 0x0f; 
-
+    // Global share difficulty. Lower prefix = harder shares = fewer submits.
+    // Example: 000f original/easy, 0008 ~2x harder, 0004 ~4x, 0002 ~8x.
+    let share_target = configured_share_target()?;
+    tracing::info!(
+        "pool share target prefix: {}",
+        hex::encode(&share_target[..4])
+    );
     // Strip the UI checksum from the pool address so the backend node accepts it
     // during block template generation.
     let clean_pool_address_bytes = crate::core::types::parse_address_flexible(&pool_address)
