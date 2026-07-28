@@ -874,7 +874,7 @@ async fn wallet_scan(path: &PathBuf, rpc_port: u16, rpc_host: String, from_genes
         return Ok(());
     }
 
-    let base_url = format!("http://{}:{}", rpc_host, rpc_port);
+    let base_url = rpc_base_url(&rpc_host, rpc_port);
     let state: rpc::GetStateResponse = client.get(format!("{}/state", base_url))
         .send().await?.json().await?;
     let chain_height = state.height;
@@ -1704,7 +1704,7 @@ async fn wallet_restore(path: &PathBuf, phrase_arg: Option<String>, rpc_port: u1
     // a full window of GAP_LIMIT consecutive unused keys is found.
     println!("Starting chain scan to rediscover coins...");
     let client = reqwest::Client::new();
-    let base_url = format!("http://{}:{}", rpc_host, rpc_port);
+    let base_url = rpc_base_url(&rpc_host, rpc_port);
     
     let state: rpc::GetStateResponse = client.get(format!("{}/state", base_url))
         .send().await?.json().await?;
@@ -2039,7 +2039,7 @@ async fn wallet_consolidate(
     // address and import whatever we were missing. `targeted_scan` writes newly-found
     // coins into the wallet, so anything discovered here is then included in the sweep
     // below rather than stranded. --force skips the scan for offline/advanced use.
-    let base_url = format!("http://{}:{}", rpc_host, rpc_port);
+    let base_url = rpc_base_url(&rpc_host, rpc_port);
     if force {
         tracing::warn!("--force set: skipping chain-side completeness check before consolidate");
     } else {
@@ -4732,8 +4732,17 @@ println!("\n✓ MSS Address Generated!");
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+fn rpc_base_url(rpc_host: &str, rpc_port: u16) -> String {
+    let host = rpc_host.trim_end_matches('/');
+    if host.starts_with("http://") || host.starts_with("https://") {
+        host.to_string()
+    } else {
+        format!("http://{}:{}", host, rpc_port)
+    }
+}
+
 async fn check_coin_rpc(client: &reqwest::Client, rpc_port: u16, rpc_host: &str, coin_hex: &str) -> Result<bool> {
-    let url = format!("http://{}:{}/check", rpc_host, rpc_port);
+    let url = format!("{}/check", rpc_base_url(rpc_host, rpc_port));
     let req = rpc::CheckCoinRequest { coin: coin_hex.to_string() };
     let resp: rpc::CheckCoinResponse = client.post(&url).json(&req).send().await?.json().await?;
     Ok(resp.exists)

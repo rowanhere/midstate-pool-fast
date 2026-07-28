@@ -308,6 +308,17 @@ midstate wallet restore --path wallet.dat
 
 ```
 
+The wallet commands also accept an HTTPS RPC by passing the full URL as
+`--rpc-host`; the port is ignored when the host already includes `http://` or
+`https://`:
+
+```powershell
+.\midstate.exe wallet restore `
+  --path D:\BombTower\wallet\wallet.dat `
+  --rpc-host https://rpc.cypherpunk.gold `
+  --rpc-port 443
+```
+
 ## 4. Addresses & Receiving
 
 Midstate utilizes post-quantum signatures. Standard addresses are consumed upon spending.
