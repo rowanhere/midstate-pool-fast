@@ -482,6 +482,10 @@ pub struct GetTxByInputRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BlockTemplateRequest {
     pub coinbase: Vec<CoinbaseOutputJson>,
+    /// Request a coinbase-only template when the current mempool selection
+    /// cannot produce a self-validating template.
+    #[serde(default)]
+    pub exclude_mempool: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

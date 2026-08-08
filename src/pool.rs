@@ -1087,7 +1087,10 @@ pub async fn run_stratum_pool(
                 let tree = ShareMerkleTree::build(shares_vec.clone());
                 *state_clone.current_tree.write().await = tree.clone();
 
-                let mut expected_total = net_state["block_reward"].as_u64().unwrap_or(0);
+                let base_reward = net_state["block_reward"].as_u64().unwrap_or(0);
+                let mut expected_total = base_reward;
+                let mut exclude_mempool = false;
+                let mut template_attempts = 0u8;
                 state_clone
                     .current_block_reward
                     .store(expected_total, std::sync::atomic::Ordering::Relaxed);
@@ -1161,7 +1164,11 @@ pub async fn run_stratum_pool(
                         }
                     }
 
-                    let req = serde_json::json!({ "coinbase": coinbase_json });
+                    template_attempts = template_attempts.saturating_add(1);
+                    let req = serde_json::json!({
+                        "coinbase": coinbase_json,
+                        "exclude_mempool": exclude_mempool
+                    });
                     if let Ok(res) = client
                         .post(&format!("{}/block_template", rpc_url))
                         .json(&req)
@@ -1175,8 +1182,24 @@ pub async fn run_stratum_pool(
                                 if err_str.contains("Expected: ") {
                                     if let Some(num_str) = err_str.split("Expected: ").nth(1) {
                                         if let Ok(new_expected) = num_str.parse::<u64>() {
+                                            if !exclude_mempool
+                                                && expected_total != base_reward
+                                                && new_expected == base_reward
+                                            {
+                                                tracing::warn!(
+                                                    "mempool template reward oscillated; retrying pool job without mempool transactions"
+                                                );
+                                                exclude_mempool = true;
+                                            }
                                             tracing::info!("Mempool fees detected. Adjusting block value to {}", new_expected);
                                             expected_total = new_expected;
+                                            if template_attempts >= 6 {
+                                                tracing::warn!(
+                                                    "block template reward did not stabilize after {} attempts",
+                                                    template_attempts
+                                                );
+                                                break None;
+                                            }
                                             continue;
                                         }
                                     }
@@ -1279,7 +1302,10 @@ async fn build_solo_job(state: Arc<PoolState>, miner_addr: [u8; 32]) -> anyhow::
     )
     .map_err(|e| anyhow::anyhow!("invalid node target: {}", e))?;
 
-    let mut expected_total = net_state["block_reward"].as_u64().unwrap_or(0);
+    let base_reward = net_state["block_reward"].as_u64().unwrap_or(0);
+    let mut expected_total = base_reward;
+    let mut exclude_mempool = false;
+    let mut template_attempts = 0u8;
     let template_data = loop {
         let mut coinbase_json = Vec::new();
         let pool_fee = (expected_total as f64 * (state.pool_fee_percent / 100.0)) as u64;
@@ -1303,7 +1329,11 @@ async fn build_solo_job(state: Arc<PoolState>, miner_addr: [u8; 32]) -> anyhow::
             }));
         }
 
-        let req = serde_json::json!({ "coinbase": coinbase_json });
+        template_attempts = template_attempts.saturating_add(1);
+        let req = serde_json::json!({
+            "coinbase": coinbase_json,
+            "exclude_mempool": exclude_mempool
+        });
         let json: serde_json::Value = client
             .post(&format!("{}/block_template", rpc_url))
             .json(&req)
@@ -1317,11 +1347,26 @@ async fn build_solo_job(state: Arc<PoolState>, miner_addr: [u8; 32]) -> anyhow::
             if err_str.contains("Expected: ") {
                 if let Some(num_str) = err_str.split("Expected: ").nth(1) {
                     if let Ok(new_expected) = num_str.parse::<u64>() {
+                        if !exclude_mempool
+                            && expected_total != base_reward
+                            && new_expected == base_reward
+                        {
+                            tracing::warn!(
+                                "mempool template reward oscillated; retrying solo job without mempool transactions"
+                            );
+                            exclude_mempool = true;
+                        }
                         tracing::info!(
                             "Mempool fees detected. Adjusting solo block value to {}",
                             new_expected
                         );
                         expected_total = new_expected;
+                        if template_attempts >= 6 {
+                            anyhow::bail!(
+                                "solo block template reward did not stabilize after {} attempts",
+                                template_attempts
+                            );
+                        }
                         continue;
                     }
                 }

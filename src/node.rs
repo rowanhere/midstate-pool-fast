@@ -8241,6 +8241,7 @@ fn build_divergent_chain(
                     salt:    hex::encode([(i as u8).wrapping_add(0x40); 32]),
                 }
             }).collect(),
+            exclude_mempool: false,
         };
 
         let resp = build_block_template_inner(&state, vec![], &req).unwrap();

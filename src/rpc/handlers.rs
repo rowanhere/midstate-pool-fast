@@ -1581,7 +1581,11 @@ pub async fn block_template(
     Json(req): Json<crate::rpc::types::BlockTemplateRequest>,
 ) -> Result<Json<crate::rpc::types::BlockTemplateResponse>, ErrorResponse> {
     let state = node.get_state().await;
-    let (_, txs) = node.get_mempool_info().await;
+    let txs = if req.exclude_mempool {
+        Vec::new()
+    } else {
+        node.get_mempool_info().await.1
+    };
     let recent_headers = node.get_recent_headers().await;
     
     match build_checked_block_template(&state, &recent_headers, txs, &req) {
