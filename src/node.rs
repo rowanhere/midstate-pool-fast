@@ -4942,6 +4942,17 @@ pub async fn handle_sync_headers(&mut self, from: PeerId, headers: Vec<BatchHead
                 Ok(())
             }
             Err(e) => {
+                let message = e.to_string();
+                let benign_peer_rejection = from.is_some()
+                    && (message == "Commitment already in mempool"
+                        || message.starts_with("RBF rejected: new fee rate "));
+                if benign_peer_rejection {
+                    // Duplicate commit gossip and same-fee RBF retries are expected
+                    // convergence traffic. Do not inflate invalid-tx metrics or emit
+                    // a warning for every peer that rebroadcasts the same transaction.
+                    tracing::debug!("Ignored peer mempool duplicate/replacement: {}", message);
+                    return Ok(());
+                }
                 self.metrics.inc_invalid_transactions();
                 Err(e)
             }
